@@ -507,7 +507,17 @@ app.post("/api/create-pix", async (req, res) => {
     if (isFakePix) {
       return res.json({
         paymentId: 999999,
-        qr_base64: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB...",
+        const rawB64 = (trx.qr_code_base64 || "").toString().trim();
+
+    res.json({
+      paymentId,
+      qr_base64: rawB64 ? ("data:image/png;base64," + rawB64) : "",
+      copia_cola: (trx.qr_code || "").toString(),
+      fake: false,
+      amount,
+      description
+    });
+
         copia_cola: "000201FAKEPIX-CODIGO-COPIA-E-COLA",
         fake: true,
         amount,
