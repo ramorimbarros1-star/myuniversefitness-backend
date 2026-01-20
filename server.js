@@ -14,14 +14,24 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 // CORS: libera qualquer porta localhost/127.0.0.1 (dev)
-const allowedRe = /^http:\/\/(localhost|127\.0\.0\.1):\d+$/;
+const allowedOrigins = (process.env.CORS_ORIGIN || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
 app.use(cors({
   origin: function (origin, cb) {
-    if (!origin || allowedRe.test(origin)) return cb(null, true);
+    // permite curl/postman/servidor (sem origin)
+    if (!origin) return cb(null, true);
+
+    if (allowedOrigins.includes(origin)) return cb(null, true);
+
     return cb(new Error("Not allowed by CORS: " + origin));
   },
-  credentials: false
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
 }));
+app.options("*", cors());
 
 // Rate limit
 const limiter = rateLimit({ windowMs: 60 * 1000, max: 120 });
