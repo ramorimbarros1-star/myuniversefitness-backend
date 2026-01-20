@@ -218,7 +218,32 @@ app.post("/api/generate-products", async (req, res) => {
       if (has(["protetor térmico", "protetor termico"])) return "heat";
       return "other";
     }
+function pickImgFromElement($, root) {
+  const imgEl =
+    root.find("img.product-image-photo").first().length
+      ? root.find("img.product-image-photo").first()
+      : root.find("img").first();
 
+  if (!imgEl || !imgEl.length) return "";
+
+  let src =
+    imgEl.attr("src") ||
+    imgEl.attr("data-src") ||
+    imgEl.attr("data-original") ||
+    imgEl.attr("data-lazy") ||
+    "";
+
+  // srcset: pega a primeira URL
+  if (!src) {
+    const srcset = imgEl.attr("srcset") || "";
+    if (srcset) {
+      src = srcset.split(",")[0].trim().split(" ")[0].trim();
+    }
+  }
+
+  return src || "";
+}
+    
     // ---------- Parser do catálogo (Magento) ----------
     function parseProductsFromHTML(html) {
       const $ = cheerio.load(html);
@@ -231,11 +256,9 @@ app.post("/api/generate-products", async (req, res) => {
         const name = (a.text() || "").trim();
         const href = a.attr("href") || "";
 
-        let img =
-          root.find("img.product-image-photo").attr("src") ||
-          root.find("img.product-image-photo").attr("data-src") ||
-          root.find("img").first().attr("src") ||
-          "";
+        let img = pickImgFromElement($, root);
+        img = absoluteUrl(img);
+
 
         const priceText =
           root.find(".price").first().text().trim() ||
@@ -639,16 +662,35 @@ app.get("/api/charge-status", async (req, res) => {
   }
 });
 
-// ---------------- Proxy de imagens ----------------
+// ---------------- Proxy de imagens (robusto) ----------------
 app.get("/api/img", async (req, res) => {
   try {
     const url = (req.query.u || "").toString();
     if (!/^https?:\/\//i.test(url)) return res.status(400).send("Bad url");
-    const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0", Referer: "" } });
-    if (!r.ok) return res.status(502).send("Bad upstream");
+
+    const u = new URL(url);
+
+    // Alguns sites bloqueiam sem Referer/Accept apropriado
+    const headers = {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+      "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+      "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+      // Referer no domínio de origem (reduz bloqueios)
+      "Referer": u.origin + "/",
+      // Alguns CDNs checam Host/Origin indiretamente — Referer já ajuda bastante
+    };
+
+    const r = await fetch(url, { headers, redirect: "follow" });
+    if (!r.ok) {
+      console.error("IMG upstream status:", r.status, url);
+      return res.status(502).send("Bad upstream");
+    }
+
     const ct = r.headers.get("content-type") || "image/jpeg";
     res.setHeader("Content-Type", ct);
     res.setHeader("Cache-Control", "public, max-age=3600");
+
     const buf = Buffer.from(await r.arrayBuffer());
     res.end(buf);
   } catch (e) {
