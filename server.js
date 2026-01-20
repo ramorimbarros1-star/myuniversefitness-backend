@@ -1,19 +1,22 @@
-// server.js (CommonJS) — Produção: Busca MCN + PIX (FAKE opcional) + Proxy Imagens + Save Lead Google Sheets
+// server.js (CommonJS) — Produção: Busca MeuCabeloNatural + PIX (FAKE opcional) + Proxy Imagens + Leads (Google Sheets)
 require("dotenv").config({ path: require("path").join(__dirname, ".env") });
+
 const express = require("express");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
-const OpenAI = require("openai");
 const cheerio = require("cheerio");
 
 // Mercado Pago v2
 const mercadopago = require("mercadopago");
 const { MercadoPagoConfig, Payment } = mercadopago;
 
+// OpenAI (mantido por compatibilidade, mesmo que a busca seja por scraping)
+const OpenAI = require("openai");
+
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// CORS
+// ===================== CORS =====================
 const allowedOrigins = (process.env.CORS_ORIGIN || "")
   .split(",")
   .map((s) => s.trim())
@@ -22,8 +25,11 @@ const allowedOrigins = (process.env.CORS_ORIGIN || "")
 app.use(
   cors({
     origin: function (origin, cb) {
+      // permite curl/postman/servidor (sem origin)
       if (!origin) return cb(null, true);
+
       if (allowedOrigins.includes(origin)) return cb(null, true);
+
       return cb(new Error("Not allowed by CORS: " + origin));
     },
     methods: ["GET", "POST", "OPTIONS"],
@@ -32,37 +38,39 @@ app.use(
 );
 app.options("*", cors());
 
-// Rate limit
+// ===================== Rate limit =====================
 const limiter = rateLimit({ windowMs: 60 * 1000, max: 120 });
 app.use(limiter);
 
-// Flags / clientes
+// ===================== Flags / Clientes =====================
 const isFakePix = process.env.FAKE_PIX === "1";
+
 let mpClient = null;
 if (!isFakePix && process.env.MP_ACCESS_TOKEN) {
   mpClient = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN });
 }
 
-// OpenAI (mantido — seu projeto já usa/precisa)
+// OpenAI
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Google Sheets webhook (Apps Script Web App)
+// Google Sheets webhook
 const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL || "";
 
-// Health
+// ===================== Health =====================
 app.get("/api/health", (req, res) =>
-  res.json({ ok: true, fakePix: isFakePix, sheets: !!SHEETS_WEBHOOK_URL })
+  res.json({
+    ok: true,
+    fakePix: isFakePix,
+    sheets: !!SHEETS_WEBHOOK_URL,
+    corsAllowed: allowedOrigins,
+  })
 );
 
 function realToNumber(v) {
   return Math.round(Number(v) * 100) / 100;
 }
 
-/**
- * Salvar lead no Google Sheets (via Apps Script Web App)
- * Espera payload:
- * { nome, email, telefone, origem, utm_source, utm_medium, utm_campaign }
- */
+// ===================== Salvar Lead no Google Sheets =====================
 app.post("/api/save-lead", async (req, res) => {
   try {
     if (!SHEETS_WEBHOOK_URL) {
@@ -92,11 +100,12 @@ app.post("/api/save-lead", async (req, res) => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      redirect: "follow",
     });
 
     if (!r.ok) {
       const txt = await r.text().catch(() => "");
-      console.error("Sheets webhook error:", r.status, txt);
+      console.error("Sheets webhook error:", r.status, txt.slice(0, 500));
       return res.status(502).json({ ok: false, error: "Falha ao gravar no Sheets" });
     }
 
@@ -108,7 +117,7 @@ app.post("/api/save-lead", async (req, res) => {
   }
 });
 
-// ---------------- Geração por BUSCA no Meu Cabelo Natural (com filtros + DIVERSIDADE inteligente) ----------------
+// ===================== Geração: Busca no MeuCabeloNatural =====================
 app.post("/api/generate-products", async (req, res) => {
   try {
     const { answers } = req.body || {};
@@ -117,7 +126,7 @@ app.post("/api/generate-products", async (req, res) => {
     const BASE = "https://www.meucabelonatural.com.br";
     const SEARCH_URL = (q) => `${BASE}/catalogsearch/result/?q=${encodeURIComponent(q)}`;
 
-    // FALLBACKS 100% capilares
+    // Imagens fallback (capilares)
     const HAIR_FALLBACK_IMGS = [
       "https://images.pexels.com/photos/3992872/pexels-photo-3992872.jpeg?auto=compress&cs=tinysrgb&w=800",
       "https://images.pexels.com/photos/3993449/pexels-photo-3993449.jpeg?auto=compress&cs=tinysrgb&w=800",
@@ -127,26 +136,73 @@ app.post("/api/generate-products", async (req, res) => {
     ];
 
     const FORBIDDEN_TERMS = [
-      "infantil","infantis","baby","bebê","bebe","crianca","criança","kids","menino","menina",
-      "pediátric","pediatric","júnior","junior",
+      "infantil",
+      "infantis",
+      "baby",
+      "bebê",
+      "bebe",
+      "crianca",
+      "criança",
+      "kids",
+      "menino",
+      "menina",
+      "pediátric",
+      "pediatric",
+      "júnior",
+      "junior",
     ];
 
     const HAIR_KEYWORDS = [
-      "shampoo","condicionador","máscara","mascara","leave-in","leave in","tônico","tonico","óleo","oleo",
-      "ampola","protetor térmico","protetor termico","finalizador","sérum","serum","loção capilar","locao capilar",
-      "spray capilar","esfoliante capilar","anticaspa","antioleosidade","antifrizz","reparador de pontas","umect",
-      "hidrata","nutri","reconstr","ativador de cachos","creme para pentear","gelatina","gel","cachos","cache",
+      "shampoo",
+      "condicionador",
+      "máscara",
+      "mascara",
+      "leave-in",
+      "leave in",
+      "tônico",
+      "tonico",
+      "óleo",
+      "oleo",
+      "ampola",
+      "protetor térmico",
+      "protetor termico",
+      "finalizador",
+      "sérum",
+      "serum",
+      "loção capilar",
+      "locao capilar",
+      "spray capilar",
+      "esfoliante capilar",
+      "anticaspa",
+      "antioleosidade",
+      "antifrizz",
+      "reparador de pontas",
+      "umect",
+      "hidrata",
+      "nutri",
+      "reconstr",
+      "ativador de cachos",
+      "creme para pentear",
+      "gelatina",
+      "gel",
+      "cachos",
+      "cache",
     ];
 
     const toBRL = (v) => Math.round(Number(v) * 100) / 100;
 
     const isHttps = (u) => {
-      try { return new URL(u).protocol === "https:"; } catch { return false; }
+      try {
+        return new URL(u).protocol === "https:";
+      } catch {
+        return false;
+      }
     };
 
     function parseBudgetRange(txt) {
       const t = (txt || "").toLowerCase();
-      if (t.includes("até r$ 80") || t.includes("ate r$ 80") || t.includes("até 80") || t.includes("ate 80")) return [0, 80];
+      if (t.includes("até r$ 80") || t.includes("ate r$ 80") || t.includes("até 80") || t.includes("ate 80"))
+        return [0, 80];
       if (t.includes("81") || t.includes("r$ 81") || t.includes("81 - 150")) return [81, 150];
       if (t.includes("151") || t.includes("r$ 151") || t.includes("151 - 250")) return [151, 250];
       if (t.includes("251") || t.includes("r$ 251")) return [251, 9999];
@@ -177,17 +233,40 @@ app.post("/api/generate-products", async (req, res) => {
     function parseBRL(txt) {
       if (!txt) return 0;
       const t = txt.replace(/\s+/g, " ").trim();
+
+      // Formato BR: R$ 123,45
       const m = t.match(/R\$\s*([\d.]+,\d{2})/);
       if (m) return Number(m[1].replace(/\./g, "").replace(",", "."));
+
+      // Formato alternativo
       const m2 = t.match(/R\$\s*([\d.]+\.\d{2})/);
       if (m2) return Number(m2[1].replace(/\./g, ""));
+
       return 0;
     }
 
     function extractBrandFromName(name) {
       const known = [
-        "Widi Care","Yenzah","Lola","Inoar","Salon Line","Haskell","Bio Extratus","Skala",
-        "Truss","Cadiveu","Keune","Redken","Kérastase","Kerastase","Acquaflora","Amend","Eico","Forever Liss",
+        "Widi Care",
+        "Yenzah",
+        "Lola",
+        "Inoar",
+        "Salon Line",
+        "Haskell",
+        "Bio Extratus",
+        "Skala",
+        "Truss",
+        "Cadiveu",
+        "Keune",
+        "Redken",
+        "Kérastase",
+        "Kerastase",
+        "Acquaflora",
+        "Amend",
+        "Eico",
+        "Forever Liss",
+        "Dabelle",
+        "Dabur",
       ];
       const hit = known.find((b) => name.toLowerCase().includes(b.toLowerCase()));
       return hit || "";
@@ -196,12 +275,12 @@ app.post("/api/generate-products", async (req, res) => {
     function classifyType(name) {
       const n = (name || "").toLowerCase();
       const has = (arr) => arr.some((k) => n.includes(k));
-
       if (has(["shampoo", "anticaspa", "antioleosidade"])) return "shampoo";
       if (has(["condicionador"])) return "condicionador";
       if (has(["máscara", "mascara", "tratamento", "hidrata", "nutri", "reconstr", "umect"])) return "mask";
       if (has(["tônico", "tonico", "loção capilar", "locao capilar"])) return "tonic";
-      if (has(["leave-in", "leave in", "creme para pentear", "ativador de cachos", "gelatina", "finalizador"])) return "leavein";
+      if (has(["leave-in", "leave in", "creme para pentear", "ativador de cachos", "gelatina", "finalizador"]))
+        return "leavein";
       if (has(["óleo", "oleo", "reparador de pontas", "sérum", "serum"])) return "oil";
       if (has(["protetor térmico", "protetor termico"])) return "heat";
       return "other";
@@ -389,15 +468,20 @@ app.post("/api/generate-products", async (req, res) => {
       );
     }
 
-    const strict = results.filter((p) => p._score > -Infinity && (p.preco > 0 ? inBudget(p.preco, BUDGET_MIN, BUDGET_MAX) : true));
+    const strict = results.filter(
+      (p) => p._score > -Infinity && (p.preco > 0 ? inBudget(p.preco, BUDGET_MIN, BUDGET_MAX) : true)
+    );
 
     let pool = strict;
     if (pool.length < 9) {
       const widenMin = Math.max(0, Math.floor(BUDGET_MIN * 0.8));
       const widenMax = Math.ceil(BUDGET_MAX * 1.2);
-      pool = results.filter((p) => p._score > -Infinity && (p.preco > 0 ? inBudget(p.preco, widenMin, widenMax) : true));
+      pool = results.filter(
+        (p) => p._score > -Infinity && (p.preco > 0 ? inBudget(p.preco, widenMin, widenMax) : true)
+      );
     }
 
+    // ordena e remove duplicatas
     const seen = new Set();
     const ranked = pool
       .sort((a, b) => b._score - a._score)
@@ -415,6 +499,7 @@ app.post("/api/generate-products", async (req, res) => {
       return toBRL(candidates[slotIdx % candidates.length]);
     }
 
+    // diversidade por “tipo de produto” (shampoo / máscara / finalizador etc)
     const preferredTypesBySlot = [
       new Set(["shampoo", "tonic"]),
       new Set(["mask", "condicionador"]),
@@ -425,9 +510,7 @@ app.post("/api/generate-products", async (req, res) => {
       const preferred = preferredTypesBySlot[slotIdx];
       const candidates = list.filter((p) => !chosenUrls.has(p.onde_comprar));
 
-      const bestPreferred = candidates
-        .filter((p) => preferred.has(p._type))
-        .sort((a, b) => b._score - a._score);
+      const bestPreferred = candidates.filter((p) => preferred.has(p._type)).sort((a, b) => b._score - a._score);
 
       let pick =
         bestPreferred.find((p) => p.marca && !chosenBrands.has(p.marca)) ||
@@ -474,7 +557,8 @@ app.post("/api/generate-products", async (req, res) => {
       if (nameLc.includes("cachos") || nameLc.includes("cache")) beneficios.push("Definição e tratamento para ondas/cachos");
       if (beneficios.length === 0) beneficios.push("Cuidado capilar coerente ao seu perfil");
 
-      const motivo = "Selecionado para equilibrar sua rotina (limpeza, tratamento e finalização), respeitando seu perfil e orçamento.";
+      const motivo =
+        "Selecionado para equilibrar sua rotina (limpeza, tratamento e finalização), respeitando seu perfil e orçamento.";
 
       return {
         id: ("mcn-" + Buffer.from(p.onde_comprar).toString("base64")).replace(/=+$/, ""),
@@ -488,14 +572,28 @@ app.post("/api/generate-products", async (req, res) => {
       };
     });
 
-    res.json({ products: top3 });
+    // se por algum motivo vier <3, completa com fallback
+    while (top3.length < 3) {
+      top3.push({
+        id: "mcn-extra-" + (top3.length + 1),
+        nome: "Tratamento capilar (seleção)",
+        marca: "Meu Cabelo Natural",
+        preco: toBRL(Math.max(49.9, BUDGET_MIN || 49.9)),
+        foto: HAIR_FALLBACK_IMGS[top3.length % HAIR_FALLBACK_IMGS.length],
+        beneficios: ["Cuidado capilar coerente ao seu perfil"],
+        motivo: "Completa sua rotina respeitando seu orçamento.",
+        onde_comprar: SEARCH_URL("tratamento capilar"),
+      });
+    }
+
+    res.json({ products: top3.slice(0, 3) });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Falha ao gerar produtos (MCN diversidade)" });
+    res.status(500).json({ error: "Falha ao gerar produtos (MCN)" });
   }
 });
 
-// ---------------- PIX: criar cobrança (FAKE ou REAL) ----------------
+// ===================== PIX: criar cobrança (FAKE ou REAL) =====================
 app.post("/api/create-pix", async (req, res) => {
   try {
     const body = req.body || {};
@@ -507,17 +605,7 @@ app.post("/api/create-pix", async (req, res) => {
     if (isFakePix) {
       return res.json({
         paymentId: 999999,
-        const rawB64 = (trx.qr_code_base64 || "").toString().trim();
-
-    res.json({
-      paymentId,
-      qr_base64: rawB64 ? ("data:image/png;base64," + rawB64) : "",
-      copia_cola: (trx.qr_code || "").toString(),
-      fake: false,
-      amount,
-      description
-    });
-
+        qr_base64: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB...", // placeholder
         copia_cola: "000201FAKEPIX-CODIGO-COPIA-E-COLA",
         fake: true,
         amount,
@@ -542,10 +630,13 @@ app.post("/api/create-pix", async (req, res) => {
     const trx = payment?.point_of_interaction?.transaction_data || {};
     const paymentId = payment?.id;
 
+    // ✅ Fix: evita gerar "data:image/png;base64," vazio
+    const rawB64 = (trx.qr_code_base64 || "").toString().trim();
+
     res.json({
       paymentId,
-      qr_base64: "data:image/png;base64," + (trx.qr_code_base64 || ""),
-      copia_cola: trx.qr_code || "",
+      qr_base64: rawB64 ? "data:image/png;base64," + rawB64 : "",
+      copia_cola: (trx.qr_code || "").toString(),
       fake: false,
       amount,
       description,
@@ -556,13 +647,14 @@ app.post("/api/create-pix", async (req, res) => {
   }
 });
 
-// ---------------- PIX: status ----------------
+// ===================== PIX: status =====================
 app.get("/api/charge-status", async (req, res) => {
   try {
     if (isFakePix) return res.json({ status: "approved", fake: true });
     if (!mpClient) return res.status(500).json({ error: "Mercado Pago não configurado" });
     const id = req.query.id;
     if (!id) return res.status(400).json({ error: "id ausente" });
+
     const info = await new Payment(mpClient).get({ id: Number(id) });
     res.json({ status: info?.status || "unknown", fake: false });
   } catch (err) {
@@ -571,7 +663,7 @@ app.get("/api/charge-status", async (req, res) => {
   }
 });
 
-// ---------------- Proxy de imagens (robusto) ----------------
+// ===================== Proxy de imagens (robusto) =====================
 app.get("/api/img", async (req, res) => {
   try {
     const url = (req.query.u || "").toString();
@@ -582,9 +674,9 @@ app.get("/api/img", async (req, res) => {
     const headers = {
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-      "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+      Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
       "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-      "Referer": u.origin + "/",
+      Referer: u.origin + "/",
     };
 
     const r = await fetch(url, { headers, redirect: "follow" });
@@ -605,7 +697,7 @@ app.get("/api/img", async (req, res) => {
   }
 });
 
-// Start
+// ===================== Start =====================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`API on http://0.0.0.0:${PORT}  |  Fake PIX: ${isFakePix ? "ON" : "OFF"}`);
