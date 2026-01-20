@@ -1,4 +1,4 @@
-// server.js (CommonJS) — v4: IA + PIX (FAKE_PIX opcional) + Proxy de Imagens
+// server.js (CommonJS) — Produção: Busca MCN + PIX (FAKE opcional) + Proxy Imagens + Save Lead Google Sheets
 require("dotenv").config({ path: require("path").join(__dirname, ".env") });
 const express = require("express");
 const cors = require("cors");
@@ -43,15 +43,70 @@ if (!isFakePix && process.env.MP_ACCESS_TOKEN) {
   mpClient = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN });
 }
 
-// OpenAI (mantido — opcional, não usado aqui)
+// OpenAI (mantido — seu projeto já usa/precisa)
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// Google Sheets webhook (Apps Script Web App)
+const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL || "";
+
 // Health
-app.get("/api/health", (req, res) => res.json({ ok: true, fakePix: isFakePix }));
+app.get("/api/health", (req, res) =>
+  res.json({ ok: true, fakePix: isFakePix, sheets: !!SHEETS_WEBHOOK_URL })
+);
 
 function realToNumber(v) {
   return Math.round(Number(v) * 100) / 100;
 }
+
+/**
+ * Salvar lead no Google Sheets (via Apps Script Web App)
+ * Espera payload:
+ * { nome, email, telefone, origem, utm_source, utm_medium, utm_campaign }
+ */
+app.post("/api/save-lead", async (req, res) => {
+  try {
+    if (!SHEETS_WEBHOOK_URL) {
+      return res.status(500).json({ ok: false, error: "SHEETS_WEBHOOK_URL não configurada" });
+    }
+
+    const body = req.body || {};
+    const nome = (body.nome || "").toString().trim();
+    const email = (body.email || "").toString().trim();
+    const telefone = (body.telefone || "").toString().trim();
+
+    if (!nome || !email || !telefone) {
+      return res.status(400).json({ ok: false, error: "nome/email/telefone são obrigatórios" });
+    }
+
+    const payload = {
+      nome,
+      email,
+      telefone,
+      origem: (body.origem || "site").toString(),
+      utm_source: (body.utm_source || "").toString(),
+      utm_medium: (body.utm_medium || "").toString(),
+      utm_campaign: (body.utm_campaign || "").toString(),
+    };
+
+    const r = await fetch(SHEETS_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!r.ok) {
+      const txt = await r.text().catch(() => "");
+      console.error("Sheets webhook error:", r.status, txt);
+      return res.status(502).json({ ok: false, error: "Falha ao gravar no Sheets" });
+    }
+
+    const data = await r.json().catch(() => ({ ok: true }));
+    return res.json({ ok: true, sheets: data });
+  } catch (err) {
+    console.error("save-lead error:", err);
+    return res.status(500).json({ ok: false, error: "Erro interno ao salvar lead" });
+  }
+});
 
 // ---------------- Geração por BUSCA no Meu Cabelo Natural (com filtros + DIVERSIDADE inteligente) ----------------
 app.post("/api/generate-products", async (req, res) => {
@@ -72,75 +127,26 @@ app.post("/api/generate-products", async (req, res) => {
     ];
 
     const FORBIDDEN_TERMS = [
-      "infantil",
-      "infantis",
-      "baby",
-      "bebê",
-      "bebe",
-      "crianca",
-      "criança",
-      "kids",
-      "menino",
-      "menina",
-      "pediátric",
-      "pediatric",
-      "júnior",
-      "junior",
+      "infantil","infantis","baby","bebê","bebe","crianca","criança","kids","menino","menina",
+      "pediátric","pediatric","júnior","junior",
     ];
 
-    // palavras para garantir que é capilar (bem amplo)
     const HAIR_KEYWORDS = [
-      "shampoo",
-      "condicionador",
-      "máscara",
-      "mascara",
-      "leave-in",
-      "leave in",
-      "tônico",
-      "tonico",
-      "óleo",
-      "oleo",
-      "ampola",
-      "protetor térmico",
-      "protetor termico",
-      "finalizador",
-      "sérum",
-      "serum",
-      "loção capilar",
-      "locao capilar",
-      "spray capilar",
-      "esfoliante capilar",
-      "anticaspa",
-      "antioleosidade",
-      "antifrizz",
-      "reparador de pontas",
-      "umect",
-      "hidrata",
-      "nutri",
-      "reconstr",
-      "ativador de cachos",
-      "creme para pentear",
-      "gelatina",
-      "gel",
-      "cachos",
-      "cache",
+      "shampoo","condicionador","máscara","mascara","leave-in","leave in","tônico","tonico","óleo","oleo",
+      "ampola","protetor térmico","protetor termico","finalizador","sérum","serum","loção capilar","locao capilar",
+      "spray capilar","esfoliante capilar","anticaspa","antioleosidade","antifrizz","reparador de pontas","umect",
+      "hidrata","nutri","reconstr","ativador de cachos","creme para pentear","gelatina","gel","cachos","cache",
     ];
 
     const toBRL = (v) => Math.round(Number(v) * 100) / 100;
 
     const isHttps = (u) => {
-      try {
-        const x = new URL(u);
-        return x.protocol === "https:";
-      } catch {
-        return false;
-      }
+      try { return new URL(u).protocol === "https:"; } catch { return false; }
     };
 
     function parseBudgetRange(txt) {
       const t = (txt || "").toLowerCase();
-      if (t.includes("até r$ 80") || t.includes("ate r$ 80") || t.includes("até 80") || t.includes("ate 80"))
-        return [0, 80];
+      if (t.includes("até r$ 80") || t.includes("ate r$ 80") || t.includes("até 80") || t.includes("ate 80")) return [0, 80];
       if (t.includes("81") || t.includes("r$ 81") || t.includes("81 - 150")) return [81, 150];
       if (t.includes("151") || t.includes("r$ 151") || t.includes("151 - 250")) return [151, 250];
       if (t.includes("251") || t.includes("r$ 251")) return [251, 9999];
@@ -180,33 +186,15 @@ app.post("/api/generate-products", async (req, res) => {
 
     function extractBrandFromName(name) {
       const known = [
-        "Widi Care",
-        "Yenzah",
-        "Lola",
-        "Inoar",
-        "Salon Line",
-        "Haskell",
-        "Bio Extratus",
-        "Skala",
-        "Truss",
-        "Cadiveu",
-        "Keune",
-        "Redken",
-        "Kérastase",
-        "Kerastase",
-        "Acquaflora",
-        "Amend",
-        "Eico",
-        "Forever Liss",
+        "Widi Care","Yenzah","Lola","Inoar","Salon Line","Haskell","Bio Extratus","Skala",
+        "Truss","Cadiveu","Keune","Redken","Kérastase","Kerastase","Acquaflora","Amend","Eico","Forever Liss",
       ];
       const hit = known.find((b) => name.toLowerCase().includes(b.toLowerCase()));
       return hit || "";
     }
 
-    // ---------- Classificação de "tipo de item" para garantir diversidade ----------
     function classifyType(name) {
       const n = (name || "").toLowerCase();
-
       const has = (arr) => arr.some((k) => n.includes(k));
 
       if (has(["shampoo", "anticaspa", "antioleosidade"])) return "shampoo";
@@ -218,33 +206,29 @@ app.post("/api/generate-products", async (req, res) => {
       if (has(["protetor térmico", "protetor termico"])) return "heat";
       return "other";
     }
-function pickImgFromElement($, root) {
-  const imgEl =
-    root.find("img.product-image-photo").first().length
-      ? root.find("img.product-image-photo").first()
-      : root.find("img").first();
 
-  if (!imgEl || !imgEl.length) return "";
+    function pickImgFromElement($, root) {
+      const imgEl =
+        root.find("img.product-image-photo").first().length
+          ? root.find("img.product-image-photo").first()
+          : root.find("img").first();
 
-  let src =
-    imgEl.attr("src") ||
-    imgEl.attr("data-src") ||
-    imgEl.attr("data-original") ||
-    imgEl.attr("data-lazy") ||
-    "";
+      if (!imgEl || !imgEl.length) return "";
 
-  // srcset: pega a primeira URL
-  if (!src) {
-    const srcset = imgEl.attr("srcset") || "";
-    if (srcset) {
-      src = srcset.split(",")[0].trim().split(" ")[0].trim();
+      let src =
+        imgEl.attr("src") ||
+        imgEl.attr("data-src") ||
+        imgEl.attr("data-original") ||
+        imgEl.attr("data-lazy") ||
+        "";
+
+      if (!src) {
+        const srcset = imgEl.attr("srcset") || "";
+        if (srcset) src = srcset.split(",")[0].trim().split(" ")[0].trim();
+      }
+      return src || "";
     }
-  }
 
-  return src || "";
-}
-    
-    // ---------- Parser do catálogo (Magento) ----------
     function parseProductsFromHTML(html) {
       const $ = cheerio.load(html);
       const items = [];
@@ -258,7 +242,6 @@ function pickImgFromElement($, root) {
 
         let img = pickImgFromElement($, root);
         img = absoluteUrl(img);
-
 
         const priceText =
           root.find(".price").first().text().trim() ||
@@ -275,33 +258,12 @@ function pickImgFromElement($, root) {
           nome: name,
           marca: extractBrandFromName(name) || "Meu Cabelo Natural",
           preco: toBRL(price || 0),
-          foto: absoluteUrl(img),
+          foto: img,
           onde_comprar: absoluteUrl(href),
           _out: outOfStock,
           _type: classifyType(name),
         });
       });
-
-      // fallback básico se o seletor mudar
-      if (items.length === 0) {
-        $("a[href]").each((_, a) => {
-          const href = $(a).attr("href") || "";
-          const name = ($(a).attr("title") || $(a).text() || "").trim();
-          if (!name || name.length < 6) return;
-          if (!href.includes(BASE)) return;
-
-          const img = $(a).find("img").attr("src") || $(a).find("img").attr("data-src") || "";
-          items.push({
-            nome: name,
-            marca: extractBrandFromName(name) || "Meu Cabelo Natural",
-            preco: 0,
-            foto: absoluteUrl(img),
-            onde_comprar: absoluteUrl(href),
-            _out: false,
-            _type: classifyType(name),
-          });
-        });
-      }
 
       return items;
     }
@@ -318,7 +280,6 @@ function pickImgFromElement($, root) {
       return parseProductsFromHTML(html);
     }
 
-    // ---------- Termos de busca a partir do questionário ----------
     function buildQuery(cat, answers) {
       const parts = [cat];
 
@@ -338,13 +299,11 @@ function pickImgFromElement($, root) {
       }
 
       if (answers?.calor && answers.calor !== "Nunca") parts.push("protecao termica");
-
       if (answers?.fragrancia && answers.fragrancia !== "Neutra") parts.push(answers.fragrancia.toLowerCase());
 
       return parts.join(" ");
     }
 
-    // Decide o "mix" desejado: shampoo + mask + leavein/oil
     function desiredMix(answers) {
       const inc = answers?.inc || [];
       const wantsAntiOil = inc.includes("Oleosidade");
@@ -354,18 +313,15 @@ function pickImgFromElement($, root) {
       const wantsSplit = inc.includes("Pontas duplas");
       const wantsDry = inc.includes("Ressecamento");
 
-      // Primeiro item (limpeza/tratamento do couro)
       let first = "shampoo";
       if (wantsDandruff) first = "shampoo anticaspa";
       else if (wantsAntiOil) first = "shampoo antioleosidade";
 
-      // Segundo item (tratamento profundo)
       let second = "mascara hidratante";
       if (wantsDry) second = "mascara hidratante";
       else if (answers?.quimica && answers.quimica !== "Nenhuma") second = "mascara reconstrucao";
       else second = "mascara nutricao";
 
-      // Terceiro item (finalização)
       let third = "leave-in";
       if (wantsFrizz) third = "leave-in antifrizz";
       else if (wantsSplit) third = "oleo reparador";
@@ -375,7 +331,6 @@ function pickImgFromElement($, root) {
       return [first, second, third];
     }
 
-    // ---------- Score ----------
     const [BUDGET_MIN, BUDGET_MAX] = parseBudgetRange(answers?.orcamento);
 
     function scoreProduct(p, answers, catText) {
@@ -384,36 +339,28 @@ function pickImgFromElement($, root) {
 
       if (isForbidden(name)) return -Infinity;
       if (!isHairCategory(name)) s -= 6;
-
       if (p._out) s -= 10;
 
-      // match por palavras da categoria/termo
       if (catText) {
         for (const kw of catText.split(/\s+/)) {
-          if (!kw) continue;
-          if (name.includes(kw.toLowerCase())) s += 1.5;
+          if (kw && name.includes(kw.toLowerCase())) s += 1.5;
         }
       }
 
-      // tipo do cabelo
       if (answers?.tipo && name.includes(answers.tipo.toLowerCase())) s += 1.25;
 
-      // incômodos
       for (const inc of answers?.inc || []) {
         const k = (inc || "").toLowerCase();
         if (k && name.includes(k)) s += 1.0;
       }
 
-      // orçamento
       if (p.preco > 0) {
         if (inBudget(p.preco, BUDGET_MIN, BUDGET_MAX)) s += 2.5;
         else s -= 3.5;
       } else {
-        // preço não exibido: pequena penalidade
         s -= 0.75;
       }
 
-      // qualidade do link/foto
       if (p.onde_comprar && p.onde_comprar.startsWith(BASE + "/")) s += 0.75;
       if (p.foto && isHttps(p.foto)) s += 0.5;
       if (p.marca) s += 0.25;
@@ -421,7 +368,6 @@ function pickImgFromElement($, root) {
       return s;
     }
 
-    // ---------- Busca e pool ----------
     const mix = desiredMix(answers);
     const queries = mix.map((cat) => buildQuery(cat, answers));
 
@@ -439,34 +385,10 @@ function pickImgFromElement($, root) {
         results.push({
           ...p,
           _score: scoreProduct(p, answers, mix[i]),
-          _q: q,
         })
       );
     }
 
-    // fallback extra se tiver pouco resultado: busca genérica por tipo + rotina
-    if (results.length < 10) {
-      const fallbackQueries = [
-        buildQuery("shampoo", answers),
-        buildQuery("mascara", answers),
-        buildQuery("leave-in", answers),
-      ];
-      for (const q of fallbackQueries) {
-        const lst = (await mcnSearch(q))
-          .filter((p) => p && p.nome && p.onde_comprar)
-          .filter((p) => !isForbidden(p.nome))
-          .filter((p) => isHairCategory(p.nome));
-        lst.forEach((p) =>
-          results.push({
-            ...p,
-            _score: scoreProduct(p, answers, q),
-            _q: q,
-          })
-        );
-      }
-    }
-
-    // orçamento estrito e widen
     const strict = results.filter((p) => p._score > -Infinity && (p.preco > 0 ? inBudget(p.preco, BUDGET_MIN, BUDGET_MAX) : true));
 
     let pool = strict;
@@ -476,14 +398,12 @@ function pickImgFromElement($, root) {
       pool = results.filter((p) => p._score > -Infinity && (p.preco > 0 ? inBudget(p.preco, widenMin, widenMax) : true));
     }
 
-    // ordena e dedup
     const seen = new Set();
     const ranked = pool
       .sort((a, b) => b._score - a._score)
       .filter((p) => p.onde_comprar && p.onde_comprar.startsWith(BASE + "/"))
       .filter((p) => (seen.has(p.onde_comprar) ? false : (seen.add(p.onde_comprar), true)));
 
-    // preço estimado caso o site não mostre (mantém dentro do orçamento)
     function estimatePriceForSlot(slotIdx) {
       const min = Math.max(19.9, BUDGET_MIN || 0);
       const max = Math.max(min + 10, BUDGET_MAX || 150);
@@ -495,18 +415,16 @@ function pickImgFromElement($, root) {
       return toBRL(candidates[slotIdx % candidates.length]);
     }
 
-    // ---------- Seleção DIVERSA: 1 shampoo + 1 mask + 1 finalizador ----------
     const preferredTypesBySlot = [
-      new Set(["shampoo", "tonic"]),            // slot 0
-      new Set(["mask", "condicionador"]),       // slot 1
-      new Set(["leavein", "oil", "heat", "other"]), // slot 2
+      new Set(["shampoo", "tonic"]),
+      new Set(["mask", "condicionador"]),
+      new Set(["leavein", "oil", "heat", "other"]),
     ];
 
     function pickBestForSlot(list, slotIdx, chosenUrls, chosenBrands) {
       const preferred = preferredTypesBySlot[slotIdx];
       const candidates = list.filter((p) => !chosenUrls.has(p.onde_comprar));
 
-      // 1) tenta pegar do tipo preferido e marca diferente (se possível)
       const bestPreferred = candidates
         .filter((p) => preferred.has(p._type))
         .sort((a, b) => b._score - a._score);
@@ -515,9 +433,7 @@ function pickImgFromElement($, root) {
         bestPreferred.find((p) => p.marca && !chosenBrands.has(p.marca)) ||
         bestPreferred[0];
 
-      // 2) se não achou, pega o melhor geral
       if (!pick) pick = candidates.sort((a, b) => b._score - a._score)[0];
-
       return pick || null;
     }
 
@@ -533,7 +449,6 @@ function pickImgFromElement($, root) {
       if (p.marca) chosenBrands.add(p.marca);
     }
 
-    // se ainda não tiver 3, completa com melhores restantes
     let idx = 0;
     while (chosen.length < 3 && idx < ranked.length) {
       const p = ranked[idx++];
@@ -544,7 +459,6 @@ function pickImgFromElement($, root) {
       if (p.marca) chosenBrands.add(p.marca);
     }
 
-    // monta resposta final
     const top3 = chosen.slice(0, 3).map((p, i) => {
       const foto = isHttps(p.foto) ? p.foto : HAIR_FALLBACK_IMGS[i % HAIR_FALLBACK_IMGS.length];
       const preco = p.preco && p.preco > 0 ? toBRL(p.preco) : estimatePriceForSlot(i);
@@ -558,10 +472,9 @@ function pickImgFromElement($, root) {
       if (nameLc.includes("anticaspa")) beneficios.push("Ação anticaspa");
       if (nameLc.includes("reconstr") || nameLc.includes("danific")) beneficios.push("Reconstrução para fios danificados");
       if (nameLc.includes("cachos") || nameLc.includes("cache")) beneficios.push("Definição e tratamento para ondas/cachos");
-      if (nameLc.includes("termic") || nameLc.includes("calor")) beneficios.push("Proteção contra calor");
       if (beneficios.length === 0) beneficios.push("Cuidado capilar coerente ao seu perfil");
 
-      const motivo = `Selecionado para equilibrar sua rotina (limpeza, tratamento e finalização), respeitando seu perfil e orçamento.`;
+      const motivo = "Selecionado para equilibrar sua rotina (limpeza, tratamento e finalização), respeitando seu perfil e orçamento.";
 
       return {
         id: ("mcn-" + Buffer.from(p.onde_comprar).toString("base64")).replace(/=+$/, ""),
@@ -574,20 +487,6 @@ function pickImgFromElement($, root) {
         onde_comprar: p.onde_comprar,
       };
     });
-
-    // completar se <3
-    while (top3.length < 3) {
-      top3.push({
-        id: "mcn-extra-" + (top3.length + 1),
-        nome: "Tratamento Capilar (Meu Cabelo Natural)",
-        marca: "Meu Cabelo Natural",
-        preco: toBRL(Math.max(BUDGET_MIN, 59.9)),
-        foto: HAIR_FALLBACK_IMGS[top3.length % HAIR_FALLBACK_IMGS.length],
-        beneficios: ["Cuidado capilar coerente ao seu perfil"],
-        motivo: "Completa sua rotina respeitando seu orçamento.",
-        onde_comprar: SEARCH_URL("cabelo tratamento"),
-      });
-    }
 
     res.json({ products: top3 });
   } catch (err) {
@@ -670,15 +569,12 @@ app.get("/api/img", async (req, res) => {
 
     const u = new URL(url);
 
-    // Alguns sites bloqueiam sem Referer/Accept apropriado
     const headers = {
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
       "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
       "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-      // Referer no domínio de origem (reduz bloqueios)
       "Referer": u.origin + "/",
-      // Alguns CDNs checam Host/Origin indiretamente — Referer já ajuda bastante
     };
 
     const r = await fetch(url, { headers, redirect: "follow" });
