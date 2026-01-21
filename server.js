@@ -1,4 +1,5 @@
 // server.js (CommonJS) — Produção: Busca MeuCabeloNatural + PIX (FAKE opcional) + Proxy Imagens + Leads (Google Sheets)
+// v3: melhora orçamento (se não achar na faixa alta, desce para faixas abaixo) + evita fallback genérico de busca
 require("dotenv").config({ path: require("path").join(__dirname, ".env") });
 
 const express = require("express");
@@ -10,7 +11,7 @@ const cheerio = require("cheerio");
 const mercadopago = require("mercadopago");
 const { MercadoPagoConfig, Payment } = mercadopago;
 
-// OpenAI (mantido por compatibilidade, mesmo que a busca seja por scraping)
+// OpenAI (mantido por compatibilidade)
 const OpenAI = require("openai");
 
 const app = express();
@@ -433,6 +434,7 @@ app.post("/api/generate-products", async (req, res) => {
         if (k && name.includes(k)) s += 1.0;
       }
 
+      // orçamento: não elimina, mas penaliza fora da faixa
       if (p.preco > 0) {
         if (inBudget(p.preco, BUDGET_MIN, BUDGET_MAX)) s += 2.5;
         else s -= 3.5;
@@ -468,17 +470,41 @@ app.post("/api/generate-products", async (req, res) => {
       );
     }
 
+    // ===================== NOVA LÓGICA DE ORÇAMENTO (desce faixas se não achar na alta) =====================
+    // 1) tenta respeitar a faixa (min..max)
     const strict = results.filter(
-      (p) => p._score > -Infinity && (p.preco > 0 ? inBudget(p.preco, BUDGET_MIN, BUDGET_MAX) : true)
+      (p) =>
+        p._score > -Infinity &&
+        (p.preco > 0 ? inBudget(p.preco, BUDGET_MIN, BUDGET_MAX) : true)
     );
 
     let pool = strict;
+
+    // 2) se não tiver opções suficientes, amplia a faixa em ±20%
     if (pool.length < 9) {
       const widenMin = Math.max(0, Math.floor(BUDGET_MIN * 0.8));
       const widenMax = Math.ceil(BUDGET_MAX * 1.2);
+
       pool = results.filter(
-        (p) => p._score > -Infinity && (p.preco > 0 ? inBudget(p.preco, widenMin, widenMax) : true)
+        (p) =>
+          p._score > -Infinity &&
+          (p.preco > 0 ? inBudget(p.preco, widenMin, widenMax) : true)
       );
+    }
+
+    // 3) ✅ se ainda não tiver o suficiente, aceita preços ABAIXO do mínimo (0..max)
+    //    (resolve: faixas 151-250 e 251+ trazendo produtos das faixas abaixo)
+    if (pool.length < 3) {
+      pool = results.filter(
+        (p) =>
+          p._score > -Infinity &&
+          (p.preco > 0 ? p.preco <= BUDGET_MAX : true)
+      );
+    }
+
+    // 4) última proteção: se mesmo assim estiver baixo, remove filtro de preço
+    if (pool.length < 3) {
+      pool = results.filter((p) => p._score > -Infinity);
     }
 
     // ordena e remove duplicatas
@@ -572,17 +598,38 @@ app.post("/api/generate-products", async (req, res) => {
       };
     });
 
-    // se por algum motivo vier <3, completa com fallback
+    // ===================== Completar com itens reais antes de usar busca genérica =====================
+    let cursor = 0;
+    while (top3.length < 3 && cursor < ranked.length) {
+      const p = ranked[cursor++];
+      if (!p || !p.onde_comprar) continue;
+
+      // evita duplicar
+      if (top3.some((x) => x.onde_comprar === p.onde_comprar)) continue;
+
+      top3.push({
+        id: ("mcn-extra-" + Buffer.from(p.onde_comprar).toString("base64")).replace(/=+$/, ""),
+        nome: p.nome || "Produto capilar",
+        marca: p.marca || "Meu Cabelo Natural",
+        preco: (p.preco && p.preco > 0) ? toBRL(p.preco) : toBRL(Math.max(49.9, BUDGET_MIN || 49.9)),
+        foto: isHttps(p.foto) ? p.foto : HAIR_FALLBACK_IMGS[top3.length % HAIR_FALLBACK_IMGS.length],
+        beneficios: ["Cuidado capilar coerente ao seu perfil"],
+        motivo: "Opção adicional para completar sua rotina respeitando disponibilidade e orçamento.",
+        onde_comprar: p.onde_comprar
+      });
+    }
+
+    // se mesmo assim não tiver, usa busca (raro)
     while (top3.length < 3) {
       top3.push({
-        id: "mcn-extra-" + (top3.length + 1),
-        nome: "Tratamento capilar (seleção)",
+        id: "mcn-busca-" + (top3.length + 1),
+        nome: "Sugestão capilar (busca)",
         marca: "Meu Cabelo Natural",
         preco: toBRL(Math.max(49.9, BUDGET_MIN || 49.9)),
         foto: HAIR_FALLBACK_IMGS[top3.length % HAIR_FALLBACK_IMGS.length],
-        beneficios: ["Cuidado capilar coerente ao seu perfil"],
-        motivo: "Completa sua rotina respeitando seu orçamento.",
-        onde_comprar: SEARCH_URL("tratamento capilar"),
+        beneficios: ["Veja mais opções no site"],
+        motivo: "Não encontramos 3 itens ideais no momento; veja opções disponíveis.",
+        onde_comprar: SEARCH_URL("shampoo")
       });
     }
 
