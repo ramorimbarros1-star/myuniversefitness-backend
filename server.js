@@ -124,7 +124,7 @@ app.post("/api/generate-products", async (req, res) => {
     const { answers } = req.body || {};
     if (!answers) return res.status(400).json({ error: "answers ausente" });
 
-    const BASE = "https://www.belezanaweb.com.br/";
+    const BASE = "https://www.belezanaweb.com.br";
     const SEARCH_URL = (q) => `${BASE}/catalogsearch/result/?q=${encodeURIComponent(q)}`;
 
     // Imagens fallback (capilares)
