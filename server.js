@@ -124,7 +124,7 @@ app.post("/api/generate-products", async (req, res) => {
     const { answers } = req.body || {};
     if (!answers) return res.status(400).json({ error: "answers ausente" });
 
-    const BASE = "https://www.opaque.com.br/outlet?O=OrderByBestDiscountDESC&utm_source=rakuten&utm_medium=afiliados&utm_term=4587713&ranMID=47714&ranEAID=OyPY4YHfHl4&ranSiteID=OyPY4YHfHl4-vkFAFeo1VXJkQq.edLvnbg";
+    const BASE = "https://www.opaque.com.br/outlet?O=OrderByBestDiscountDESC&utm_source=rakuten&utm_medium=afiliados&utm_term=4587713&ranMID=47714&ranEAID=OyPY4YHfHl4&ranSiteID=OyPY4YHfHl4-vkFAFeo1VXJkQq.edLvnbg/";
     const SEARCH_URL = (q) => `${BASE}/catalogsearch/result/?q=${encodeURIComponent(q)}`;
 
     // Imagens fallback (capilares)
