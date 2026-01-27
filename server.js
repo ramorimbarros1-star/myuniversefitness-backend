@@ -66,6 +66,27 @@ function realToNumber(v) {
   return Math.round(Number(v) * 100) / 100;
 }
 
+function cleanUrlSlashes(u) {
+  // evita "https://site.com//categoria//produto"
+  return u.replace(/([^:]\/)\/+/g, "$1");
+}
+
+function ensureHttps(u) {
+  if (!u) return "";
+  return u.replace(/^http:\/\//i, "https://");
+}
+
+function ensureEndsWithP(u) {
+  if (!u) return "";
+  // garante /p no final (VTEX)
+  if (/\/p(\?|$)/i.test(u)) return u;
+  if (u.includes("?")) {
+    const [path, qs] = u.split("?");
+    return path.replace(/\/$/, "") + "/p?" + qs;
+  }
+  return u.replace(/\/$/, "") + "/p";
+}
+
 // ===================== Salvar Lead no Google Sheets =====================
 app.post("/api/save-lead", async (req, res) => {
   try {
@@ -190,19 +211,56 @@ app.post("/api/generate-products", async (req, res) => {
       return "other";
     }
 
+    // ✅ MONTA URL REAL DO PRODUTO (evita redirecionar pra home)
+    function buildOpaqueProductUrl(p) {
+      // 1) tente usar p.link (geralmente vem completo e correto)
+      let url = (p?.link || "").toString().trim();
+
+      // alguns retornam URL relativa
+      if (url && !/^https?:\/\//i.test(url)) {
+        if (!url.startsWith("/")) url = "/" + url;
+        url = BASE + url;
+      }
+
+      // 2) se não tiver link, monte usando categories + linkText
+      if (!url) {
+        const linkText = (p?.linkText || "").toString().trim();
+        const cats = Array.isArray(p?.categories) ? p.categories : [];
+        const catPath = (cats[0] || "").toString().trim(); // ex: "/Outlet/Maquiagem/"
+        if (linkText) {
+          if (catPath && catPath.startsWith("/")) {
+            url = BASE + catPath.replace(/\/$/, "") + "/" + linkText;
+          } else {
+            url = BASE + "/" + linkText;
+          }
+        }
+      }
+
+      url = ensureHttps(url);
+      url = cleanUrlSlashes(url);
+      url = ensureEndsWithP(url);
+
+      // segurança final
+      if (!url.startsWith(BASE + "/")) return "";
+      return url;
+    }
+
     function normalizeOpaqueProduct(p) {
       // Estrutura típica VTEX:
-      // productName, brand, linkText, items[0].images[0].imageUrl, sellers[0].commertialOffer.Price/AvailableQuantity
-      const name = p?.productName || "";
-      const brand = p?.brand || "Opaque";
-      const linkText = p?.linkText || "";
-      const url = p?.link || (linkText ? `${BASE}/${linkText}/p` : "");
+      // productName, brand, linkText, link, categories, items[0].images[0].imageUrl, sellers[0].commertialOffer.Price/AvailableQuantity
+      const name = (p?.productName || "").toString().trim();
+      const brand = (p?.brand || "Opaque").toString().trim();
+
       const item = Array.isArray(p?.items) ? p.items[0] : null;
-      const img = item?.images?.[0]?.imageUrl || "";
+      const imgRaw = item?.images?.[0]?.imageUrl || "";
+      const img = ensureHttps((imgRaw || "").toString().trim());
+
       const seller = Array.isArray(item?.sellers) ? item.sellers[0] : null;
       const offer = seller?.commertialOffer || {};
       const price = Number(offer?.Price || offer?.spotPrice || 0);
       const available = Number(offer?.AvailableQuantity || 0);
+
+      const url = buildOpaqueProductUrl(p);
 
       return {
         nome: name,
@@ -237,7 +295,7 @@ app.post("/api/generate-products", async (req, res) => {
 
       return data
         .map(normalizeOpaqueProduct)
-        .filter((x) => x && x.nome && x.onde_comprar);
+        .filter((x) => x && x.nome && x.onde_comprar); // ✅ só fica com URL válida
     }
 
     // --------- Monta as 3 buscas com base nas respostas ----------
@@ -268,7 +326,7 @@ app.post("/api/generate-products", async (req, res) => {
       if (incTxt.includes("acne")) parts.push("acne");
       if (incTxt.includes("manchas")) parts.push("manchas");
       if (incTxt.includes("olheiras")) parts.push("olheiras");
-      if (incTxt.includes("derrete") || incTxt.includes("fixação")) parts.push("longa duração");
+      if (incTxt.includes("derrete") || incTxt.includes("fixação") || incTxt.includes("fixacao")) parts.push("longa duração");
 
       return parts.join(" ");
     }
@@ -297,7 +355,7 @@ app.post("/api/generate-products", async (req, res) => {
         if (name.includes(c.split(" ")[0])) s += 2.2;
       }
 
-      // orçamento: não elimina, mas puxa para dentro
+      // orçamento
       if (p.preco > 0) {
         if (inBudget(p.preco, BUDGET_MIN, BUDGET_MAX)) s += 2.8;
         else s -= 3.2;
@@ -330,29 +388,23 @@ app.post("/api/generate-products", async (req, res) => {
         .filter((p) => !isForbidden(p.nome))
         .filter((p) => p.onde_comprar && p.onde_comprar.startsWith(BASE + "/"));
 
-      lst.forEach((p) =>
-        results.push({ ...p, _score: scoreProduct(p, mix[i]) })
-      );
+      lst.forEach((p) => results.push({ ...p, _score: scoreProduct(p, mix[i]) }));
     }
 
     // ===================== Lógica de orçamento (desce faixas se necessário) =====================
-    // 1) tenta faixa exata
     const strict = results.filter((p) => p._score > -Infinity && (p.preco > 0 ? inBudget(p.preco, BUDGET_MIN, BUDGET_MAX) : true));
     let pool = strict;
 
-    // 2) amplia ±20%
     if (pool.length < 9) {
       const widenMin = Math.max(0, Math.floor(BUDGET_MIN * 0.8));
       const widenMax = Math.ceil(BUDGET_MAX * 1.2);
       pool = results.filter((p) => p._score > -Infinity && (p.preco > 0 ? inBudget(p.preco, widenMin, widenMax) : true));
     }
 
-    // 3) se ainda faltar, aceita abaixo do máximo (resolve faixa alta sem produto)
     if (pool.length < 3) {
       pool = results.filter((p) => p._score > -Infinity && (p.preco > 0 ? p.preco <= BUDGET_MAX : true));
     }
 
-    // 4) último fallback: remove filtro de preço
     if (pool.length < 3) {
       pool = results.filter((p) => p._score > -Infinity);
     }
@@ -425,7 +477,7 @@ app.post("/api/generate-products", async (req, res) => {
       };
     });
 
-    // fallback final (muito raro): se ainda faltou, cria itens apontando para OUTLET
+    // fallback final: se ainda faltou, cria itens apontando para OUTLET
     while (top3.length < 3) {
       top3.push({
         id: "opaque-outlet-" + (top3.length + 1),
