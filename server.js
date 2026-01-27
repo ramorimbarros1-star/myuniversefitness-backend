@@ -1,6 +1,5 @@
 // server.js (CommonJS) — Produção: OPAQUE (Tratamento Face) + PIX (FAKE opcional) + Proxy Imagens + Leads (Google Sheets)
-// v5: retorna 5 produtos (rotina facial completa) e mantém links /p válidos.
-
+// vX: inclui link afiliado Rakuten em TODOS os links de produtos
 require("dotenv").config({ path: require("path").join(__dirname, ".env") });
 
 const express = require("express");
@@ -11,7 +10,7 @@ const rateLimit = require("express-rate-limit");
 const mercadopago = require("mercadopago");
 const { MercadoPagoConfig, Payment } = mercadopago;
 
-// OpenAI (mantido por compatibilidade)
+// OpenAI (mantido por compatibilidade; não é obrigatório para esta busca)
 const OpenAI = require("openai");
 
 const app = express();
@@ -48,7 +47,7 @@ if (!isFakePix && process.env.MP_ACCESS_TOKEN) {
   mpClient = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN });
 }
 
-// OpenAI (não é obrigatório para a busca)
+// OpenAI (compat)
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // Google Sheets webhook
@@ -78,13 +77,6 @@ function isHttps(u) {
   } catch {
     return false;
   }
-}
-
-function absoluteUrl(base, u) {
-  if (!u) return "";
-  if (/^https?:\/\//i.test(u)) return u.replace(/^http:\/\//i, "https://");
-  if (u.startsWith("/")) return (base + u).replace(/^http:\/\//i, "https://");
-  return (base + "/" + u).replace(/^http:\/\//i, "https://");
 }
 
 // ===================== Salvar Lead no Google Sheets =====================
@@ -134,7 +126,7 @@ app.post("/api/save-lead", async (req, res) => {
   }
 });
 
-// ===================== Geração: Busca na OPAQUE (Tratamento/Face) =====================
+// ===================== Geração: Busca OPAQUE (Face) =====================
 app.post("/api/generate-products", async (req, res) => {
   try {
     const { answers } = req.body || {};
@@ -142,40 +134,60 @@ app.post("/api/generate-products", async (req, res) => {
 
     const BASE = "https://www.opaque.com.br";
 
-    // VTEX: rota de categoria + fallback por ft
-    const FACE_ROUTE_API = `${BASE}/api/catalog_system/pub/products/search/tratamento/face?_from=0&_to=49`;
-    const SEARCH_FT_API = (q) =>
-      `${BASE}/api/catalog_system/pub/products/search/?ft=${encodeURIComponent(q)}&_from=0&_to=24`;
+    // ===== Rakuten (Afiliado) =====
+    const RAKUTEN_PARAMS = {
+      utm_source: "rakuten",
+      utm_medium: "afiliados",
+      utm_term: "4587713",
+      ranMID: "47714",
+      ranEAID: "OyPY4YHfHl4",
+      ranSiteID: "OyPY4YHfHl4-5t9np1DoTPuG6fO28twrDA",
+    };
 
-    // Fallbacks (skincare/rosto)
+    function addRakutenAffiliate(url) {
+      try {
+        if (!url) return url;
+        const u = new URL(url);
+
+        // Só aplica no domínio Opaque
+        if (!u.hostname.endsWith("opaque.com.br")) return url;
+
+        Object.entries(RAKUTEN_PARAMS).forEach(([k, v]) => {
+          u.searchParams.set(k, v);
+        });
+
+        return u.toString();
+      } catch {
+        return url;
+      }
+    }
+
+    // ✅ endpoint VTEX (JSON) — estável
+    const SEARCH_API = (q, from = 0, to = 24) =>
+      `${BASE}/api/catalog_system/pub/products/search/?ft=${encodeURIComponent(q)}&O=OrderByBestDiscountDESC&_from=${from}&_to=${to}`;
+
+    // Imagens fallback (rotina facial)
     const FACE_FALLBACK_IMGS = [
-      "https://images.pexels.com/photos/3762453/pexels-photo-3762453.jpeg?auto=compress&cs=tinysrgb&w=800",
-      "https://images.pexels.com/photos/3865792/pexels-photo-3865792.jpeg?auto=compress&cs=tinysrgb&w=800",
-      "https://images.pexels.com/photos/3993441/pexels-photo-3993441.jpeg?auto=compress&cs=tinysrgb&w=800",
-      "https://images.pexels.com/photos/7581570/pexels-photo-7581570.jpeg?auto=compress&cs=tinysrgb&w=800",
-      "https://images.pexels.com/photos/6621464/pexels-photo-6621464.jpeg?auto=compress&cs=tinysrgb&w=800",
+      "https://images.pexels.com/photos/3762879/pexels-photo-3762879.jpeg?auto=compress&cs=tinysrgb&w=800",
+      "https://images.pexels.com/photos/6621457/pexels-photo-6621457.jpeg?auto=compress&cs=tinysrgb&w=800",
+      "https://images.pexels.com/photos/3738349/pexels-photo-3738349.jpeg?auto=compress&cs=tinysrgb&w=800",
+      "https://images.pexels.com/photos/7755641/pexels-photo-7755641.jpeg?auto=compress&cs=tinysrgb&w=800",
+      "https://images.pexels.com/photos/3756450/pexels-photo-3756450.jpeg?auto=compress&cs=tinysrgb&w=800",
     ];
 
     const FORBIDDEN_TERMS = [
       "infantil","infantis","baby","bebê","bebe","crianca","criança","kids","menino","menina","pediátric","pediatric","júnior","junior"
     ];
 
-    // keywords para manter em “face/skincare”
+    // Palavras-chave de “face / skincare” para evitar itens fora de contexto
     const FACE_KEYWORDS = [
-      "limpeza","limpador","cleanser","gel de limpeza","espuma","sabonete","agua micelar","água micelar",
-      "hidrat","hydr","creme","loção","locao","serum","sérum","vitamina c","niacinamida","ácido","acido",
-      "esfol","peeling","protetor","fps","solar","sunscreen","tonico","tônico","anti-idade","antirrugas",
-      "rosto","face"
+      "limpador","limpeza","cleanser","sabonete","gel de limpeza","espuma","água micelar","agua micelar",
+      "hidratante","hidratação","hidratacao","moisturizer","creme","gel creme",
+      "esfoliante","esfoliação","esfoliacao","scrub","peeling",
+      "protetor","protetor solar","fps","sunscreen","solar",
+      "sérum","serum","vitamina c","niacinamida","ácido","acido","hialurônico","hialuronico",
+      "tônico","tonico","máscara","mascara","face","facial"
     ];
-
-    function parseBudgetRange(txt) {
-      const t = (txt || "").toLowerCase();
-      if (t.includes("até r$ 80") || t.includes("ate r$ 80") || t.includes("até 80") || t.includes("ate 80")) return [0, 80];
-      if (t.includes("81") || t.includes("r$ 81") || t.includes("81 - 150")) return [81, 150];
-      if (t.includes("151") || t.includes("r$ 151") || t.includes("151 - 250")) return [151, 250];
-      if (t.includes("251") || t.includes("r$ 251")) return [251, 9999];
-      return [0, 9999];
-    }
 
     function isForbidden(name) {
       const n = (name || "").toLowerCase();
@@ -191,62 +203,76 @@ app.post("/api/generate-products", async (req, res) => {
       return Number.isFinite(price) && price >= min && price <= max;
     }
 
+    // ✅ faixas mais detalhadas
+    function parseBudgetRange(txt) {
+      const t = (txt || "").toLowerCase();
+
+      // aceita tanto "R$ 81 - R$ 150" quanto texto semelhante
+      if (t.includes("até r$ 50") || t.includes("ate r$ 50") || t.includes("até 50") || t.includes("ate 50")) return [0, 50];
+      if (t.includes("51") && t.includes("80")) return [51, 80];
+      if (t.includes("81") && (t.includes("150") || t.includes("151") === false)) return [81, 150];
+      if (t.includes("151") && t.includes("200")) return [151, 200];
+      if (t.includes("201") && t.includes("250")) return [201, 250];
+      if (t.includes("251") && t.includes("350")) return [251, 350];
+      if (t.includes("351") || t.includes("acima") || t.includes("mais de")) return [351, 9999];
+
+      // fallback compatível com versões antigas
+      if (t.includes("até r$ 80") || t.includes("ate r$ 80") || t.includes("até 80") || t.includes("ate 80")) return [0, 80];
+      if (t.includes("81") || t.includes("r$ 81") || t.includes("81 - 150")) return [81, 150];
+      if (t.includes("151") || t.includes("r$ 151") || t.includes("151 - 250")) return [151, 250];
+      if (t.includes("251") || t.includes("r$ 251")) return [251, 9999];
+
+      return [0, 9999];
+    }
+
     function classifyType(name) {
       const n = (name || "").toLowerCase();
       const has = (arr) => arr.some((k) => n.includes(k));
-      if (has(["gel de limpeza","limpeza","limpador","cleanser","sabonete","espuma","agua micelar","água micelar"])) return "cleanser";
-      if (has(["hidrat","creme","loção","locao"])) return "moisturizer";
-      if (has(["protetor","fps","solar","sunscreen"])) return "sunscreen";
-      if (has(["esfol","peeling"])) return "exfoliant";
-      if (has(["serum","sérum","vitamina c","niacinamida","ácido","acido"])) return "serum";
+      if (has(["protetor solar","fps","sunscreen","solar"])) return "sunscreen";
+      if (has(["limpador","limpeza","sabonete","gel de limpeza","espuma","agua micelar","água micelar"])) return "cleanser";
+      if (has(["hidratante","hidratação","hidratacao","moisturizer"])) return "moisturizer";
+      if (has(["esfoliante","esfoliação","esfoliacao","peeling","scrub"])) return "exfoliant";
+      if (has(["sérum","serum","vitamina c","niacinamida","hialuron"])) return "serum";
       if (has(["tônico","tonico"])) return "toner";
       return "other";
     }
 
     function buildProductUrlFromVtex(p) {
-      const link = (p?.link || "").toString().trim();
-      if (link) return absoluteUrl(BASE, link);
-
-      const linkText = (p?.linkText || "").toString().trim();
+      // VTEX costuma retornar linkText; URL do produto: /{linkText}/p
+      const linkText = p?.linkText || "";
       if (linkText) return `${BASE}/${linkText}/p`;
-
+      const link = p?.link || "";
+      if (link && link.startsWith("http")) return link;
       return "";
     }
 
-    function pickImageFromVtex(p) {
+    function normalizeOpaqueProduct(p) {
+      const name = p?.productName || "";
+      const brand = p?.brand || "Opaque";
+      const urlRaw = buildProductUrlFromVtex(p);
+      const url = addRakutenAffiliate(urlRaw);
+
       const item = Array.isArray(p?.items) ? p.items[0] : null;
       const img = item?.images?.[0]?.imageUrl || "";
-      return absoluteUrl(BASE, img);
-    }
-
-    function pickPriceFromVtex(p) {
-      const item = Array.isArray(p?.items) ? p.items[0] : null;
       const seller = Array.isArray(item?.sellers) ? item.sellers[0] : null;
       const offer = seller?.commertialOffer || {};
       const price = Number(offer?.Price || offer?.spotPrice || 0);
       const available = Number(offer?.AvailableQuantity || 0);
-      return { price: toBRL(price || 0), available };
-    }
-
-    function normalizeOpaqueProduct(p) {
-      const name = (p?.productName || "").toString().trim();
-      const brand = (p?.brand || "Opaque").toString().trim();
-      const onde_comprar = buildProductUrlFromVtex(p);
-      const foto = pickImageFromVtex(p);
-      const { price, available } = pickPriceFromVtex(p);
 
       return {
         nome: name,
         marca: brand,
-        foto: foto ? foto.replace(/^http:\/\//i, "https://") : "",
-        preco: price,
-        onde_comprar: onde_comprar ? onde_comprar.replace(/^http:\/\//i, "https://") : "",
+        foto: img,
+        preco: toBRL(price || 0),
+        onde_comprar: url,
         _out: available === 0,
         _type: classifyType(name),
       };
     }
 
-    async function fetchJson(url) {
+    async function opaqueSearch(query) {
+      const url = SEARCH_API(query, 0, 29);
+
       const r = await fetch(url, {
         method: "GET",
         redirect: "follow",
@@ -255,54 +281,53 @@ app.post("/api/generate-products", async (req, res) => {
           accept: "application/json,text/plain,*/*",
         },
       });
+
       if (!r.ok) {
         console.error("Opaque API status:", r.status, url);
         return [];
       }
+
       const data = await r.json().catch(() => []);
-      return Array.isArray(data) ? data : [];
+      if (!Array.isArray(data)) return [];
+
+      return data
+        .map(normalizeOpaqueProduct)
+        .filter((x) => x && x.nome && x.onde_comprar);
     }
 
-    async function opaqueFaceList() {
-      const data = await fetchJson(FACE_ROUTE_API);
-      return data.map(normalizeOpaqueProduct);
-    }
-
-    async function opaqueSearchFt(q) {
-      const data = await fetchJson(SEARCH_FT_API(q));
-      return data.map(normalizeOpaqueProduct);
-    }
-
-    // ------------------- Queries -------------------
-    const inc = Array.isArray(answers?.inc) ? answers.inc : [];
-    const pele = (answers?.pele || "").toString().toLowerCase();
+    // ===== Respostas do questionário (face) =====
+    const pele = (answers?.pele || "").toLowerCase();          // oleosa / seca / mista / sensível
+    const sensibilidade = (answers?.sensibilidade || "").toLowerCase(); // sim/nao (opcional)
+    const inc = Array.isArray(answers?.inc) ? answers.inc : []; // ex: acne, manchas, poros, ressecamento, oleosidade, etc.
     const incTxt = inc.join(" ").toLowerCase();
 
     function buildQuery(cat) {
-      const parts = [cat];
+      const parts = [cat, "face", "facial"];
 
-      if (pele.includes("oleos")) parts.push("oleosa");
-      if (pele.includes("seca")) parts.push("seca");
-      if (pele.includes("sens")) parts.push("sensível");
+      if (pele.includes("oleos")) parts.push("pele oleosa");
+      if (pele.includes("seca")) parts.push("pele seca");
+      if (pele.includes("mista")) parts.push("pele mista");
+      if (pele.includes("sens") || sensibilidade.includes("sim")) parts.push("pele sensível");
 
       if (incTxt.includes("acne")) parts.push("acne");
-      if (incTxt.includes("mancha")) parts.push("manchas");
+      if (incTxt.includes("manchas")) parts.push("manchas");
       if (incTxt.includes("poros")) parts.push("poros");
-      if (incTxt.includes("oleos")) parts.push("controle de oleosidade");
-      if (incTxt.includes("ressec") || incTxt.includes("seca")) parts.push("hidratação");
+      if (incTxt.includes("ressec")) parts.push("hidratacao");
+      if (incTxt.includes("oleos")) parts.push("controle oleosidade");
 
       return parts.join(" ");
     }
 
-    // ✅ 5 produtos (rotina facial): limpeza, sérum, hidratante, protetor, esfoliante
+    // Mix 5 produtos (rotina facial)
     const mix = [
-      "limpeza facial",
-      "sérum facial",
+      "limpador facial",
       "hidratante facial",
       "protetor solar facial",
+      "sérum facial",
       "esfoliante facial",
     ];
-    const queries = mix.map(buildQuery);
+
+    const queries = mix.map((cat) => buildQuery(cat));
 
     const [BUDGET_MIN, BUDGET_MAX] = parseBudgetRange(answers?.orcamento);
 
@@ -310,65 +335,59 @@ app.post("/api/generate-products", async (req, res) => {
       let s = 0;
       const name = (p.nome || "").toLowerCase();
 
-      // URL válida de produto
-      if (!p.onde_comprar || !p.onde_comprar.startsWith(BASE + "/") || !p.onde_comprar.endsWith("/p")) return -Infinity;
-
-      if (!p.nome) return -Infinity;
       if (isForbidden(name)) return -Infinity;
+      if (p._out) s -= 12;
 
-      if (!isFaceCategory(name)) s -= 6;
-      else s += 2;
+      // tem que ser face/skincare (senão penaliza forte)
+      if (!isFaceCategory(name)) s -= 10;
+      else s += 2.5;
 
+      // encaixe com a categoria do slot
       if (catText) {
         const c = catText.toLowerCase();
-        const firstWord = c.split(" ")[0];
-        if (firstWord && name.includes(firstWord)) s += 2.0;
-        for (const kw of c.split(/\s+/)) {
-          if (kw && name.includes(kw)) s += 0.6;
-        }
+        const token = c.split(" ")[0];
+        if (token && name.includes(token)) s += 2.2;
       }
 
-      if (p._out) s -= 10;
+      // pele/incômodos
+      if (pele.includes("oleos") && (name.includes("oil") || name.includes("oleos") || name.includes("controle"))) s += 1.2;
+      if (pele.includes("seca") && (name.includes("hidrat") || name.includes("hialur") || name.includes("nutri"))) s += 1.2;
+      if (incTxt.includes("acne") && (name.includes("acne") || name.includes("salic") || name.includes("clean"))) s += 1.2;
+      if (incTxt.includes("manchas") && (name.includes("vitamina c") || name.includes("clare") || name.includes("niacin"))) s += 1.0;
+      if ((pele.includes("sens") || sensibilidade.includes("sim")) && (name.includes("sens") || name.includes("calm") || name.includes("suave"))) s += 1.0;
 
       // orçamento
       if (p.preco > 0) {
-        if (inBudget(p.preco, BUDGET_MIN, BUDGET_MAX)) s += 2.6;
-        else s -= 3.2;
+        if (inBudget(p.preco, BUDGET_MIN, BUDGET_MAX)) s += 3.0;
+        else s -= 3.5;
       } else {
         s -= 0.75;
       }
 
+      // link e imagem
+      if (p.onde_comprar && p.onde_comprar.includes("opaque.com.br/")) s += 0.8;
       if (p.foto && isHttps(p.foto)) s += 0.6;
       if (p.marca) s += 0.25;
 
       return s;
     }
 
-    // Coleta resultados por query (ft) e fallback por lista da categoria
     const results = [];
     for (let i = 0; i < queries.length; i++) {
       const q = queries[i];
+      let lst = await opaqueSearch(q);
 
-      let lst = await opaqueSearchFt(q);
-
-      if (!lst || lst.length === 0) {
-        const allFace = await opaqueFaceList();
-        const qWords = q.toLowerCase().split(/\s+/).filter(Boolean);
-        lst = allFace.filter((p) => {
-          const n = (p.nome || "").toLowerCase();
-          return qWords.some((w) => n.includes(w));
-        });
-      }
-
-      lst = (lst || [])
-        .filter((p) => p && p.nome && p.onde_comprar)
-        .filter((p) => !isForbidden(p.nome));
+      lst = lst
+        .filter((p) => !isForbidden(p.nome))
+        .filter((p) => p.onde_comprar && p.onde_comprar.includes("opaque.com.br/"));
 
       lst.forEach((p) => results.push({ ...p, _score: scoreProduct(p, mix[i]) }));
     }
 
-    // ========= orçamento (desce faixas se necessário) =========
-    const strict = results.filter((p) => p._score > -Infinity && (p.preco > 0 ? inBudget(p.preco, BUDGET_MIN, BUDGET_MAX) : true));
+    // ===== Lógica de orçamento (desce faixas se necessário) =====
+    const strict = results.filter(
+      (p) => p._score > -Infinity && (p.preco > 0 ? inBudget(p.preco, BUDGET_MIN, BUDGET_MAX) : true)
+    );
     let pool = strict;
 
     if (pool.length < 15) {
@@ -385,23 +404,23 @@ app.post("/api/generate-products", async (req, res) => {
       pool = results.filter((p) => p._score > -Infinity);
     }
 
-    // ordena e remove duplicatas
+    // ordena e remove duplicatas por URL
     const seen = new Set();
     const ranked = pool
       .sort((a, b) => b._score - a._score)
       .filter((p) => (seen.has(p.onde_comprar) ? false : (seen.add(p.onde_comprar), true)));
 
-    // diversidade por slot (5)
+    // diversidade por tipo (para os 5 slots)
     const preferredTypesBySlot = [
-      new Set(["cleanser", "other"]),
-      new Set(["serum", "toner", "other"]),
-      new Set(["moisturizer", "serum", "other"]),
-      new Set(["sunscreen", "other"]),
-      new Set(["exfoliant", "other"]),
+      new Set(["cleanser"]),
+      new Set(["moisturizer"]),
+      new Set(["sunscreen"]),
+      new Set(["serum", "toner"]),
+      new Set(["exfoliant"]),
     ];
 
     function pickBestForSlot(list, slotIdx, chosenUrls) {
-      const preferred = preferredTypesBySlot[slotIdx];
+      const preferred = preferredTypesBySlot[slotIdx] || new Set();
       const candidates = list.filter((p) => !chosenUrls.has(p.onde_comprar));
       const bestPreferred = candidates.filter((p) => preferred.has(p._type)).sort((a, b) => b._score - a._score);
       return bestPreferred[0] || candidates.sort((a, b) => b._score - a._score)[0] || null;
@@ -417,7 +436,6 @@ app.post("/api/generate-products", async (req, res) => {
       chosenUrls.add(p.onde_comprar);
     }
 
-    // completa se faltou
     let idx = 0;
     while (chosen.length < 5 && idx < ranked.length) {
       const p = ranked[idx++];
@@ -430,45 +448,51 @@ app.post("/api/generate-products", async (req, res) => {
     function makeBenefits(p) {
       const n = (p.nome || "").toLowerCase();
       const b = [];
-      if (n.includes("vitamina c") || n.includes("c ")) b.push("Ajuda a dar viço e uniformizar o tom");
-      if (n.includes("niacin")) b.push("Ajuda no controle de oleosidade e poros");
-      if (n.includes("hidrat") || n.includes("hialur")) b.push("Hidratação para o dia a dia");
-      if (n.includes("fps") || n.includes("solar") || n.includes("protetor")) b.push("Proteção diária contra o sol");
-      if (n.includes("limp") || n.includes("clean") || n.includes("sabonete")) b.push("Limpeza suave para rotina diária");
-      if (n.includes("esfol") || n.includes("peeling")) b.push("Renovação e textura mais uniforme");
-      if (b.length === 0) b.push("Combina com sua rotina diária de cuidados faciais");
+      if (n.includes("fps") || n.includes("solar")) b.push("Proteção diária para a pele");
+      if (n.includes("hidrat") || n.includes("hialur")) b.push("Hidratação e conforto");
+      if (n.includes("vitamina c") || n.includes("niacin")) b.push("Ajuda a uniformizar o tom");
+      if (n.includes("acne") || n.includes("salic")) b.push("Ajuda no controle de acne/oleosidade");
+      if (n.includes("sens") || n.includes("suave")) b.push("Mais gentil para pele sensível");
+      if (b.length === 0) b.push("Combina com seu perfil e rotina facial");
       return b.slice(0, 4);
     }
 
     const top5 = chosen.slice(0, 5).map((p, i) => {
       const foto = isHttps(p.foto) ? p.foto : FACE_FALLBACK_IMGS[i % FACE_FALLBACK_IMGS.length];
-      const preco = p.preco && p.preco > 0 ? toBRL(p.preco) : toBRL(Math.max(49.9, BUDGET_MIN || 49.9));
+      const preco = p.preco && p.preco > 0 ? toBRL(p.preco) : toBRL(Math.max(39.9, BUDGET_MIN || 39.9));
 
       return {
-        id: ("opaque-face-" + Buffer.from(p.onde_comprar).toString("base64")).replace(/=+$/, ""),
+        id: ("opaque-" + Buffer.from(p.onde_comprar).toString("base64")).replace(/=+$/, ""),
         nome: p.nome,
         marca: p.marca || "Opaque",
         preco,
         foto,
         beneficios: makeBenefits(p),
-        motivo: "Selecionado para montar sua rotina facial completa (limpeza, tratamento, hidratação, proteção e renovação), respeitando seu perfil e orçamento.",
-        onde_comprar: p.onde_comprar,
+        motivo: "Selecionado para montar uma rotina facial completa (limpeza, hidratação, proteção e tratamento), respeitando seu perfil e orçamento.",
+        // ✅ garante afiliado aqui também (dupla proteção)
+        onde_comprar: addRakutenAffiliate(p.onde_comprar),
       };
     });
 
-    if (top5.length < 5) {
-      console.error("Sem produtos suficientes com URL válida. Resultado:", {
-        got: top5.length,
-        totalRanked: ranked.length,
-        totalResults: results.length
+    // fallback final (raríssimo): completa com OUTLET/Face já com afiliado
+    const fallbackUrl = addRakutenAffiliate(`${BASE}/tratamento/face`);
+    while (top5.length < 5) {
+      top5.push({
+        id: "opaque-face-" + (top5.length + 1),
+        nome: "Sugestão em Tratamento Facial (Opaque)",
+        marca: "Opaque",
+        preco: toBRL(Math.max(39.9, BUDGET_MIN || 39.9)),
+        foto: FACE_FALLBACK_IMGS[top5.length % FACE_FALLBACK_IMGS.length],
+        beneficios: ["Veja mais opções disponíveis no site"],
+        motivo: "Não encontramos itens suficientes; veja opções na categoria de tratamento facial.",
+        onde_comprar: fallbackUrl,
       });
-      return res.status(502).json({ error: "Não foi possível obter 5 produtos com link válido no momento. Tente novamente." });
     }
 
-    return res.json({ products: top5 });
+    return res.json({ products: top5.slice(0, 5) });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ error: "Falha ao gerar produtos (OPAQUE FACE 5)" });
+    return res.status(500).json({ error: "Falha ao gerar produtos (OPAQUE FACE)" });
   }
 });
 
@@ -484,7 +508,7 @@ app.post("/api/create-pix", async (req, res) => {
     if (isFakePix) {
       return res.json({
         paymentId: 999999,
-        qr_base64: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB...",
+        qr_base64: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB...", // placeholder
         copia_cola: "000201FAKEPIX-CODIGO-COPIA-E-COLA",
         fake: true,
         amount,
@@ -508,6 +532,7 @@ app.post("/api/create-pix", async (req, res) => {
 
     const trx = payment?.point_of_interaction?.transaction_data || {};
     const paymentId = payment?.id;
+
     const rawB64 = (trx.qr_code_base64 || "").toString().trim();
 
     res.json({
