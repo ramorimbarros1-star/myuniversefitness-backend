@@ -1,5 +1,7 @@
-// server.js (CommonJS) — Produção: OPAQUE (Face) + PIX (FAKE opcional) + Proxy Imagens + Leads (Google Sheets)
-// vFinal+BudgetHard: orçamento rígido (NUNCA acima do teto) + indisponíveis fora + afiliado Rakuten em todos os links
+// server.js (CommonJS) — OPAQUE (Face) + PIX (FAKE opcional) + Proxy Imagens + Leads (Google Sheets)
+// vBudgetStepUp: se não achar produtos na faixa, sobe para a próxima faixa e AVISA via mensagem.
+// Também evita fallback de categoria (sempre tenta retornar produtos reais).
+
 require("dotenv").config({ path: require("path").join(__dirname, ".env") });
 
 const express = require("express");
@@ -154,8 +156,8 @@ app.post("/api/generate-products", async (req, res) => {
       }
     }
 
-    // ===== VTEX Search API =====
-    const SEARCH_API = (q, from = 0, to = 49) =>
+    // VTEX Search API (pega mais itens)
+    const SEARCH_API = (q, from = 0, to = 99) =>
       `${BASE}/api/catalog_system/pub/products/search/?ft=${encodeURIComponent(q)}&O=OrderByBestDiscountDESC&_from=${from}&_to=${to}`;
 
     // fallback images (rotina facial)
@@ -171,7 +173,6 @@ app.post("/api/generate-products", async (req, res) => {
       "infantil","infantis","baby","bebê","bebe","crianca","criança","kids","menino","menina","pediátric","pediatric","júnior","junior"
     ];
 
-    // palavras-chave face / skincare
     const FACE_KEYWORDS = [
       "limpador","limpeza","cleanser","sabonete","gel de limpeza","espuma","água micelar","agua micelar",
       "hidratante","hidratação","hidratacao","moisturizer","creme","gel creme",
@@ -185,15 +186,12 @@ app.post("/api/generate-products", async (req, res) => {
       const n = (name || "").toLowerCase();
       return FORBIDDEN_TERMS.some((t) => n.includes(t));
     }
-
     function isFaceCategory(name) {
       const n = (name || "").toLowerCase();
       return FACE_KEYWORDS.some((k) => n.includes(k));
     }
-
-    // ✅ ORÇAMENTO RÍGIDO: nunca pode passar do teto
-    function isAboveBudget(price, max) {
-      return Number.isFinite(price) && price > 0 && price > max;
+    function inRange(price, min, max) {
+      return Number.isFinite(price) && price > 0 && price >= min && price <= max;
     }
 
     function classifyType(name) {
@@ -216,7 +214,6 @@ app.post("/api/generate-products", async (req, res) => {
       return "";
     }
 
-    // ✅ disponibilidade robusta (VTEX)
     function getOfferInfo(p) {
       const item = Array.isArray(p?.items) ? p.items[0] : null;
       const seller = Array.isArray(item?.sellers) ? item.sellers[0] : null;
@@ -234,7 +231,6 @@ app.post("/api/generate-products", async (req, res) => {
       const { item, offer } = getOfferInfo(p);
 
       const img = item?.images?.[0]?.imageUrl || "";
-
       const price = Number(offer?.Price || offer?.spotPrice || 0);
 
       const isAvailFlag = typeof offer?.IsAvailable === "boolean" ? offer.IsAvailable : null;
@@ -256,8 +252,7 @@ app.post("/api/generate-products", async (req, res) => {
     }
 
     async function opaqueSearch(query) {
-      // pega bastante coisa pra aumentar chance de achar barato
-      const url = SEARCH_API(query, 0, 79);
+      const url = SEARCH_API(query, 0, 99);
 
       const r = await fetch(url, {
         method: "GET",
@@ -281,37 +276,46 @@ app.post("/api/generate-products", async (req, res) => {
         .filter((x) => x && x.nome && x.onde_comprar && x.onde_comprar.includes("opaque.com.br/"));
     }
 
-    // ===== Respostas =====
+    // ====== Faixas de preço (em ordem) ======
+    // Se não encontrar na faixa do usuário, sobe para a próxima(s).
+    const BUDGET_TIERS = [
+      { label: "Até R$ 60", min: 0, max: 60 },
+      { label: "R$ 61 - R$ 90", min: 61, max: 90 },
+      { label: "R$ 91 - R$ 120", min: 91, max: 120 },
+      { label: "R$ 121 - R$ 150", min: 121, max: 150 },
+      { label: "R$ 151 - R$ 200", min: 151, max: 200 },
+      { label: "R$ 201 - R$ 250", min: 201, max: 250 },
+      { label: "R$ 251 - R$ 350", min: 251, max: 350 },
+      { label: "R$ 351+", min: 351, max: 9999 },
+    ];
+
+    function detectTierIndex(txt) {
+      const t = (txt || "").toLowerCase();
+
+      if (t.includes("até r$ 60") || t.includes("ate r$ 60") || t.includes("até 60") || t.includes("ate 60")) return 0;
+
+      if (t.includes("61") && t.includes("90")) return 1;
+      if (t.includes("91") && t.includes("120")) return 2;
+      if (t.includes("121") && t.includes("150")) return 3;
+      if (t.includes("151") && t.includes("200")) return 4;
+      if (t.includes("201") && t.includes("250")) return 5;
+      if (t.includes("251") && t.includes("350")) return 6;
+      if (t.includes("351") || t.includes("acima") || t.includes("+")) return 7;
+
+      // compat antigo
+      if (t.includes("até r$ 80") || t.includes("ate r$ 80") || t.includes("até 80") || t.includes("ate 80")) return 1; // joga pra perto
+      if (t.includes("81") && t.includes("150")) return 3;
+      if (t.includes("151") && t.includes("250")) return 5;
+      if (t.includes("251")) return 7;
+
+      return 0;
+    }
+
+    // ===== Respostas do questionário (skin care) =====
     const pele = (answers?.pele || "").toLowerCase();
     const sensibilidade = (answers?.sensibilidade || "").toLowerCase();
     const inc = Array.isArray(answers?.inc) ? answers.inc : [];
     const incTxt = inc.join(" ").toLowerCase();
-
-    // ✅ faixas (inclui "Até R$ 60")
-    function parseBudgetRange(txt) {
-      const t = (txt || "").toLowerCase();
-
-      if (t.includes("até r$ 60") || t.includes("ate r$ 60") || t.includes("até 60") || t.includes("ate 60")) return [0, 60];
-      if (t.includes("até r$ 50") || t.includes("ate r$ 50") || t.includes("até 50") || t.includes("ate 50")) return [0, 50];
-
-      if (t.includes("61") && t.includes("90")) return [61, 90];
-      if (t.includes("91") && t.includes("120")) return [91, 120];
-      if (t.includes("121") && t.includes("150")) return [121, 150];
-      if (t.includes("151") && t.includes("200")) return [151, 200];
-      if (t.includes("201") && t.includes("250")) return [201, 250];
-      if (t.includes("251") && t.includes("350")) return [251, 350];
-      if (t.includes("351") || t.includes("acima") || t.includes("mais de")) return [351, 9999];
-
-      // compat antigo
-      if (t.includes("até r$ 80") || t.includes("ate r$ 80") || t.includes("até 80") || t.includes("ate 80")) return [0, 80];
-      if (t.includes("81") || t.includes("r$ 81") || t.includes("81 - 150")) return [81, 150];
-      if (t.includes("151") || t.includes("r$ 151") || t.includes("151 - 250")) return [151, 250];
-      if (t.includes("251") || t.includes("r$ 251")) return [251, 9999];
-
-      return [0, 9999];
-    }
-
-    const [BUDGET_MIN, BUDGET_MAX] = parseBudgetRange(answers?.orcamento);
 
     function buildQueryBase(cat) {
       const parts = [cat, "facial"];
@@ -339,6 +343,7 @@ app.post("/api/generate-products", async (req, res) => {
       return [q1, q2, q3, q5, q4];
     }
 
+    // 5 slots fixos (rotina facial)
     const mix = ["limpador", "hidratante", "protetor solar", "serum", "esfoliante"];
 
     function scoreProduct(p, catText) {
@@ -346,9 +351,6 @@ app.post("/api/generate-products", async (req, res) => {
 
       if (isForbidden(name)) return -Infinity;
       if (p._out) return -Infinity;
-
-      // ✅ orçamento rígido: elimina se passar do teto
-      if (isAboveBudget(p.preco, BUDGET_MAX)) return -Infinity;
 
       let s = 0;
 
@@ -360,24 +362,24 @@ app.post("/api/generate-products", async (req, res) => {
         if (token && name.includes(token)) s += 2.0;
       }
 
-      if (pele.includes("oleos") && (name.includes("oil") || name.includes("oleos") || name.includes("controle"))) s += 1.2;
-      if (pele.includes("seca") && (name.includes("hidrat") || name.includes("hialur") || name.includes("nutri"))) s += 1.2;
-      if (incTxt.includes("acne") && (name.includes("acne") || name.includes("salic"))) s += 1.2;
-      if (incTxt.includes("manchas") && (name.includes("vitamina c") || name.includes("niacin") || name.includes("clare"))) s += 1.0;
-      if ((pele.includes("sens") || sensibilidade.includes("sim")) && (name.includes("sens") || name.includes("suave") || name.includes("calm"))) s += 1.0;
+      if (pele.includes("oleos") && (name.includes("oil") || name.includes("oleos") || name.includes("controle"))) s += 1.1;
+      if (pele.includes("seca") && (name.includes("hidrat") || name.includes("hialur") || name.includes("nutri"))) s += 1.1;
+      if (incTxt.includes("acne") && (name.includes("acne") || name.includes("salic"))) s += 1.1;
+      if (incTxt.includes("manchas") && (name.includes("vitamina c") || name.includes("niacin") || name.includes("clare"))) s += 0.9;
+      if ((pele.includes("sens") || sensibilidade.includes("sim")) && (name.includes("sens") || name.includes("suave") || name.includes("calm"))) s += 0.9;
 
-      // dentro do orçamento (como é rígido, sempre está <= teto)
-      if (p.preco > 0) s += 1.5;
+      if (p.preco > 0) s += 1.2;
 
       if (p.foto && isHttps(p.foto)) s += 0.6;
-      if (p.marca) s += 0.25;
+      if (p.marca) s += 0.2;
       if (p.onde_comprar && p.onde_comprar.includes("opaque.com.br/")) s += 0.6;
 
       return s;
     }
 
-    // ===== Coleta resultados por slot =====
-    const results = [];
+    // ===== 1) Busca ampla (sem filtrar por orçamento ainda) =====
+    // Depois filtramos por faixa/tier (pra poder subir faixa com o mesmo conjunto).
+    const allResults = [];
     for (let i = 0; i < mix.length; i++) {
       const cat = mix[i];
       const tries = slotQueries(cat);
@@ -386,20 +388,17 @@ app.post("/api/generate-products", async (req, res) => {
       for (const q of tries) {
         const lst = await opaqueSearch(q);
 
-        // ✅ já filtra: proibido, indisponível e acima do orçamento
         const filtered = lst
-          .filter((p) => p && p.nome)
+          .filter((p) => p && p.nome && p.onde_comprar)
           .filter((p) => !isForbidden(p.nome))
-          .filter((p) => !p._out)
-          .filter((p) => !isAboveBudget(p.preco, BUDGET_MAX));
+          .filter((p) => !p._out);
 
         agg.push(...filtered);
-
-        if (agg.length >= 25) break;
+        if (agg.length >= 60) break;
       }
 
       agg.forEach((p) => {
-        results.push({
+        allResults.push({
           ...p,
           _slot: i,
           _score: scoreProduct(p, cat),
@@ -407,15 +406,15 @@ app.post("/api/generate-products", async (req, res) => {
       });
     }
 
-    const valid = results.filter((p) => Number.isFinite(p._score) && p._score > -1e9);
+    const valid = allResults.filter((p) => Number.isFinite(p._score) && p._score > -1e9);
 
-    // ✅ Orçamento rígido: NÃO EXISTE fallback de “remover filtro de preço”
-    // aqui, o pool SEMPRE respeita <= teto
-    const seen = new Set();
-    const ranked = valid
+    // remove duplicados por URL
+    const seenAll = new Set();
+    const uniqueRanked = valid
       .sort((a, b) => b._score - a._score)
-      .filter((p) => (seen.has(p.onde_comprar) ? false : (seen.add(p.onde_comprar), true)));
+      .filter((p) => (seenAll.has(p.onde_comprar) ? false : (seenAll.add(p.onde_comprar), true)));
 
+    // ===== 2) Seleciona 5 produtos, subindo faixa se necessário =====
     const preferredTypesBySlot = [
       new Set(["cleanser"]),
       new Set(["moisturizer"]),
@@ -434,26 +433,73 @@ app.post("/api/generate-products", async (req, res) => {
       return bestPreferred[0] || candidates.sort((a, b) => b._score - a._score)[0] || null;
     }
 
-    const chosenUrls = new Set();
-    const chosen = [];
+    const userTierIdx = detectTierIndex(answers?.orcamento);
+    let usedTierIdx = userTierIdx;
 
-    for (let slot = 0; slot < 5; slot++) {
-      const p = pickBestForSlot(ranked, slot, chosenUrls);
-      if (!p) break;
-      chosen.push(p);
-      chosenUrls.add(p.onde_comprar);
+    let chosen = [];
+    let chosenUrls = new Set();
+
+    function selectFromPool(pool) {
+      chosen = [];
+      chosenUrls = new Set();
+
+      for (let slot = 0; slot < 5; slot++) {
+        const p = pickBestForSlot(pool, slot, chosenUrls);
+        if (!p) break;
+        chosen.push(p);
+        chosenUrls.add(p.onde_comprar);
+      }
+
+      // completa com o restante
+      let idx = 0;
+      while (chosen.length < 5 && idx < pool.length) {
+        const p = pool[idx++];
+        if (!p) break;
+        if (chosenUrls.has(p.onde_comprar)) continue;
+        chosen.push(p);
+        chosenUrls.add(p.onde_comprar);
+      }
+
+      return chosen;
     }
 
-    // completa com qualquer item restante (ainda respeita orçamento)
-    let idx = 0;
-    while (chosen.length < 5 && idx < ranked.length) {
-      const p = ranked[idx++];
-      if (!p) break;
-      if (chosenUrls.has(p.onde_comprar)) continue;
-      chosen.push(p);
-      chosenUrls.add(p.onde_comprar);
+    function poolForTier(tier) {
+      // Tier: filtra por preço (se preco=0, descarta — evita “sem preço” atrapalhar o orçamento)
+      return uniqueRanked.filter((p) => p.preco > 0 && inRange(p.preco, tier.min, tier.max));
     }
 
+    // Tenta do tier do usuário, depois sobe
+    let pool = poolForTier(BUDGET_TIERS[usedTierIdx]);
+    selectFromPool(pool);
+
+    while (chosen.length < 5 && usedTierIdx < BUDGET_TIERS.length - 1) {
+      usedTierIdx++;
+      const nextPool = poolForTier(BUDGET_TIERS[usedTierIdx]);
+
+      // junta com o que já tinha (pra não perder alguns bons no tier anterior),
+      // mas agora aceitando a faixa mais alta também
+      pool = uniqueRanked.filter(
+        (p) => p.preco > 0 && inRange(p.preco, BUDGET_TIERS[userTierIdx].min, BUDGET_TIERS[usedTierIdx].max)
+      );
+
+      selectFromPool(pool);
+      if (chosen.length >= 5) break;
+
+      // Se mesmo juntando ainda faltou, tenta somente o pool do tier atual (às vezes enche melhor)
+      selectFromPool(nextPool);
+      if (chosen.length >= 5) break;
+    }
+
+    // ✅ Se ainda assim não achou 5, pega os 5 mais baratos disponíveis (sempre produto real)
+    if (chosen.length < 5) {
+      const cheapest = uniqueRanked
+        .filter((p) => p.preco > 0)
+        .sort((a, b) => a.preco - b.preco);
+
+      selectFromPool(cheapest);
+    }
+
+    // ===== 3) Monta resposta final + mensagem =====
     function makeBenefits(p) {
       const n = (p.nome || "").toLowerCase();
       const b = [];
@@ -468,7 +514,7 @@ app.post("/api/generate-products", async (req, res) => {
 
     const top5 = chosen.slice(0, 5).map((p, i) => {
       const foto = isHttps(p.foto) ? p.foto : FACE_FALLBACK_IMGS[i % FACE_FALLBACK_IMGS.length];
-      const preco = p.preco && p.preco > 0 ? toBRL(p.preco) : toBRL(Math.max(29.9, BUDGET_MIN || 29.9));
+      const preco = p.preco && p.preco > 0 ? toBRL(p.preco) : toBRL(49.9);
 
       return {
         id: ("opaque-" + Buffer.from(p.onde_comprar).toString("base64")).replace(/=+$/, ""),
@@ -477,28 +523,26 @@ app.post("/api/generate-products", async (req, res) => {
         preco,
         foto,
         beneficios: makeBenefits(p),
-        motivo: "Selecionado para montar uma rotina facial completa (limpeza, hidratação, proteção e tratamento), respeitando seu perfil e orçamento.",
+        motivo: "Selecionado para montar uma rotina facial completa (limpeza, hidratação, proteção e tratamento), respeitando seu perfil.",
         onde_comprar: addRakutenAffiliate(p.onde_comprar),
       };
     });
 
-    // ✅ fallback: se realmente não achou 5 produtos dentro do teto, completa com link de categoria
-    // (mas sem prometer produto “barato” — apenas “ver mais opções”)
-    const fallbackUrl = addRakutenAffiliate(`${BASE}/tratamento/face`);
-    while (top5.length < 5) {
-      top5.push({
-        id: "opaque-face-" + (top5.length + 1),
-        nome: "Ver mais opções em Tratamento Facial (Opaque)",
-        marca: "Opaque",
-        preco: toBRL(Math.max(29.9, BUDGET_MIN || 29.9)),
-        foto: FACE_FALLBACK_IMGS[top5.length % FACE_FALLBACK_IMGS.length],
-        beneficios: ["Veja mais opções disponíveis no site"],
-        motivo: "Não encontramos 5 itens dentro do seu teto de orçamento no momento; veja opções na categoria.",
-        onde_comprar: fallbackUrl,
-      });
+    let message = "";
+    if (usedTierIdx > userTierIdx) {
+      message =
+        `Não encontramos produtos suficientes na faixa de preço indicada (${BUDGET_TIERS[userTierIdx].label}). ` +
+        `Por isso, exibimos produtos na próxima faixa (${BUDGET_TIERS[usedTierIdx].label}).`;
     }
 
-    return res.json({ products: top5.slice(0, 5) });
+    return res.json({
+      products: top5,
+      message,
+      budget: {
+        chosen: BUDGET_TIERS[userTierIdx],
+        used: BUDGET_TIERS[usedTierIdx],
+      },
+    });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Falha ao gerar produtos (OPAQUE FACE)" });
