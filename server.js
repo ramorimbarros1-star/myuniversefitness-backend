@@ -66,27 +66,6 @@ function realToNumber(v) {
   return Math.round(Number(v) * 100) / 100;
 }
 
-function cleanUrlSlashes(u) {
-  // evita "https://site.com//categoria//produto"
-  return u.replace(/([^:]\/)\/+/g, "$1");
-}
-
-function ensureHttps(u) {
-  if (!u) return "";
-  return u.replace(/^http:\/\//i, "https://");
-}
-
-function ensureEndsWithP(u) {
-  if (!u) return "";
-  // garante /p no final (VTEX)
-  if (/\/p(\?|$)/i.test(u)) return u;
-  if (u.includes("?")) {
-    const [path, qs] = u.split("?");
-    return path.replace(/\/$/, "") + "/p?" + qs;
-  }
-  return u.replace(/\/$/, "") + "/p";
-}
-
 // ===================== Salvar Lead no Google Sheets =====================
 app.post("/api/save-lead", async (req, res) => {
   try {
@@ -142,10 +121,12 @@ app.post("/api/generate-products", async (req, res) => {
 
     const BASE = "https://www.opaque.com.br";
 
-    // ✅ endpoint VTEX (JSON) — mais estável que scraping HTML
-    // ft = termo buscado, O = ordenação (melhor desconto), _from/_to = paginação
+    // ✅ VTEX Search API (JSON)
     const SEARCH_API = (q) =>
       `${BASE}/api/catalog_system/pub/products/search/?ft=${encodeURIComponent(q)}&O=OrderByBestDiscountDESC&_from=0&_to=24`;
+
+    // ✅ Link de busca VTEX (não cai no outlet / home)
+    const SITE_SEARCH_URL = (q) => `${BASE}/${encodeURIComponent(q)}?map=ft`;
 
     // Fallbacks (imagem de maquiagem) caso a imagem do produto falhe
     const MAKEUP_FALLBACK_IMGS = [
@@ -160,7 +141,7 @@ app.post("/api/generate-products", async (req, res) => {
       "infantil","infantis","baby","bebê","bebe","crianca","criança","kids","menino","menina","pediátric","pediatric","júnior","junior"
     ];
 
-    // Palavras-chave “maquiagem” (para evitar retornar perfume/tratamento etc)
+    // Palavras-chave “maquiagem”
     const MAKEUP_KEYWORDS = [
       "base","corretivo","pó","po","blush","bronzer","iluminador","primer","fixador","bruma",
       "máscara","mascara","cílios","cilios","rímel","rimel","delineador","lápis","lapis",
@@ -211,56 +192,36 @@ app.post("/api/generate-products", async (req, res) => {
       return "other";
     }
 
-    // ✅ MONTA URL REAL DO PRODUTO (evita redirecionar pra home)
-    function buildOpaqueProductUrl(p) {
-      // 1) tente usar p.link (geralmente vem completo e correto)
-      let url = (p?.link || "").toString().trim();
+    // ✅ monta URL confiável de produto (linkText VTEX)
+    function buildProductUrl(p) {
+      const linkText = (p?.linkText || "").toString().trim();
+      if (linkText) return `${BASE}/${linkText}/p`;
 
-      // alguns retornam URL relativa
-      if (url && !/^https?:\/\//i.test(url)) {
-        if (!url.startsWith("/")) url = "/" + url;
-        url = BASE + url;
-      }
+      // às vezes vem um campo "link" em algumas lojas VTEX
+      const rawLink = (p?.link || "").toString().trim();
+      if (rawLink && /^https?:\/\//i.test(rawLink)) return rawLink;
 
-      // 2) se não tiver link, monte usando categories + linkText
-      if (!url) {
-        const linkText = (p?.linkText || "").toString().trim();
-        const cats = Array.isArray(p?.categories) ? p.categories : [];
-        const catPath = (cats[0] || "").toString().trim(); // ex: "/Outlet/Maquiagem/"
-        if (linkText) {
-          if (catPath && catPath.startsWith("/")) {
-            url = BASE + catPath.replace(/\/$/, "") + "/" + linkText;
-          } else {
-            url = BASE + "/" + linkText;
-          }
-        }
-      }
+      // fallback seguro: busca no site pelo nome
+      const name = (p?.productName || "").toString().trim();
+      if (name) return SITE_SEARCH_URL(name);
 
-      url = ensureHttps(url);
-      url = cleanUrlSlashes(url);
-      url = ensureEndsWithP(url);
-
-      // segurança final
-      if (!url.startsWith(BASE + "/")) return "";
-      return url;
+      // último caso
+      return `${BASE}/outlet?O=OrderByBestDiscountDESC`;
     }
 
     function normalizeOpaqueProduct(p) {
-      // Estrutura típica VTEX:
-      // productName, brand, linkText, link, categories, items[0].images[0].imageUrl, sellers[0].commertialOffer.Price/AvailableQuantity
       const name = (p?.productName || "").toString().trim();
       const brand = (p?.brand || "Opaque").toString().trim();
 
       const item = Array.isArray(p?.items) ? p.items[0] : null;
-      const imgRaw = item?.images?.[0]?.imageUrl || "";
-      const img = ensureHttps((imgRaw || "").toString().trim());
-
+      const img = item?.images?.[0]?.imageUrl || "";
       const seller = Array.isArray(item?.sellers) ? item.sellers[0] : null;
       const offer = seller?.commertialOffer || {};
+
       const price = Number(offer?.Price || offer?.spotPrice || 0);
       const available = Number(offer?.AvailableQuantity || 0);
 
-      const url = buildOpaqueProductUrl(p);
+      const url = buildProductUrl(p);
 
       return {
         nome: name,
@@ -295,7 +256,7 @@ app.post("/api/generate-products", async (req, res) => {
 
       return data
         .map(normalizeOpaqueProduct)
-        .filter((x) => x && x.nome && x.onde_comprar); // ✅ só fica com URL válida
+        .filter((x) => x && x.nome && x.onde_comprar);
     }
 
     // --------- Monta as 3 buscas com base nas respostas ----------
@@ -319,20 +280,18 @@ app.post("/api/generate-products", async (req, res) => {
       if (cobertura.includes("média") || cobertura.includes("media")) parts.push("média");
       if (cobertura.includes("alta")) parts.push("alta cobertura");
 
-      // objetivos/incômodos
       const incTxt = inc.join(" ").toLowerCase();
       if (incTxt.includes("oleos")) parts.push("controle de oleosidade");
       if (incTxt.includes("poros")) parts.push("poros");
       if (incTxt.includes("acne")) parts.push("acne");
       if (incTxt.includes("manchas")) parts.push("manchas");
       if (incTxt.includes("olheiras")) parts.push("olheiras");
-      if (incTxt.includes("derrete") || incTxt.includes("fixação") || incTxt.includes("fixacao")) parts.push("longa duração");
+      if (incTxt.includes("derrete") || incTxt.includes("fixação")) parts.push("longa duração");
 
       return parts.join(" ");
     }
 
-    // mix pensado para maquiagem diária (diversidade)
-    // slot1: pele (base/primer/corretivo), slot2: olhos, slot3: lábios/fixação
+    // mix (maquiagem diária)
     const mix = ["base", "máscara de cílios", "batom"];
     const queries = mix.map((cat) => buildQuery(cat));
 
@@ -345,17 +304,14 @@ app.post("/api/generate-products", async (req, res) => {
       if (isForbidden(name)) return -Infinity;
       if (p._out) s -= 10;
 
-      // tem que ser maquiagem (senão penaliza forte)
       if (!isMakeupCategory(name)) s -= 8;
       else s += 2;
 
-      // encaixe com a “categoria” do slot
       if (catText) {
-        const c = catText.toLowerCase();
-        if (name.includes(c.split(" ")[0])) s += 2.2;
+        const c0 = catText.toLowerCase().split(" ")[0];
+        if (c0 && name.includes(c0)) s += 2.2;
       }
 
-      // orçamento
       if (p.preco > 0) {
         if (inBudget(p.preco, BUDGET_MIN, BUDGET_MAX)) s += 2.8;
         else s -= 3.2;
@@ -363,16 +319,13 @@ app.post("/api/generate-products", async (req, res) => {
         s -= 0.75;
       }
 
-      // link e imagem
       if (p.onde_comprar && p.onde_comprar.startsWith(BASE + "/")) s += 0.7;
       if (p.foto && isHttps(p.foto)) s += 0.6;
       if (p.marca) s += 0.25;
 
-      // acabamento
       if ((answers?.acabamento || "").toLowerCase().includes("matte") && name.includes("matte")) s += 1.2;
       if ((answers?.acabamento || "").toLowerCase().includes("glow") && (name.includes("glow") || name.includes("ilumin"))) s += 1.2;
 
-      // longa duração
       const incTxt = (inc || []).join(" ").toLowerCase();
       if ((incTxt.includes("derrete") || incTxt.includes("fixa")) && (name.includes("longa") || name.includes("fix") || name.includes("24h"))) s += 1.2;
 
@@ -391,7 +344,7 @@ app.post("/api/generate-products", async (req, res) => {
       lst.forEach((p) => results.push({ ...p, _score: scoreProduct(p, mix[i]) }));
     }
 
-    // ===================== Lógica de orçamento (desce faixas se necessário) =====================
+    // ===================== Orçamento (desce faixas se necessário) =====================
     const strict = results.filter((p) => p._score > -Infinity && (p.preco > 0 ? inBudget(p.preco, BUDGET_MIN, BUDGET_MAX) : true));
     let pool = strict;
 
@@ -409,13 +362,11 @@ app.post("/api/generate-products", async (req, res) => {
       pool = results.filter((p) => p._score > -Infinity);
     }
 
-    // ordena e remove duplicatas por URL
     const seen = new Set();
     const ranked = pool
       .sort((a, b) => b._score - a._score)
       .filter((p) => (seen.has(p.onde_comprar) ? false : (seen.add(p.onde_comprar), true)));
 
-    // diversidade por “tipo de produto”
     const preferredTypesBySlot = [
       new Set(["base", "primer", "concealer", "powder"]),
       new Set(["eyes"]),
@@ -439,7 +390,6 @@ app.post("/api/generate-products", async (req, res) => {
       chosenUrls.add(p.onde_comprar);
     }
 
-    // completa se faltou
     let idx = 0;
     while (chosen.length < 3 && idx < ranked.length) {
       const p = ranked[idx++];
@@ -477,17 +427,18 @@ app.post("/api/generate-products", async (req, res) => {
       };
     });
 
-    // fallback final: se ainda faltou, cria itens apontando para OUTLET
+    // ✅ se ainda faltou, cria links de BUSCA (não outlet)
     while (top3.length < 3) {
+      const term = mix[top3.length] || "maquiagem";
       top3.push({
-        id: "opaque-outlet-" + (top3.length + 1),
-        nome: "Sugestão no Outlet Opaque",
+        id: "opaque-busca-" + (top3.length + 1),
+        nome: `Sugestão de ${term} (busca no site)`,
         marca: "Opaque",
         preco: toBRL(Math.max(49.9, BUDGET_MIN || 49.9)),
         foto: MAKEUP_FALLBACK_IMGS[top3.length % MAKEUP_FALLBACK_IMGS.length],
-        beneficios: ["Veja opções com desconto no Outlet"],
-        motivo: "Não encontramos 3 itens ideais no momento; veja as opções disponíveis com desconto.",
-        onde_comprar: `${BASE}/outlet?O=OrderByBestDiscountDESC`,
+        beneficios: ["Abrirá resultados reais no site da Opaque"],
+        motivo: "Não encontramos um item ideal pronto; abrimos uma busca direta com seu perfil.",
+        onde_comprar: SITE_SEARCH_URL(buildQuery(term)),
       });
     }
 
