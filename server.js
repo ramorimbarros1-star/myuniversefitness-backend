@@ -1,5 +1,5 @@
 // server.js (CommonJS) — Produção: OPAQUE (Face) + PIX (FAKE opcional) + Proxy Imagens + Leads (Google Sheets)
-// vFinal FIX: recomendações mais coerentes com questionário (pele + incômodos + orçamento), sempre retorna 5 produtos
+// vFinal: Prioridade por (1) tipo de pele (2) incômodos (3) orçamento; sempre retorna 5 produtos; sobe faixa se necessário
 require("dotenv").config({ path: require("path").join(__dirname, ".env") });
 
 const express = require("express");
@@ -41,7 +41,7 @@ app.use(limiter);
 
 // ===================== Flags / Clientes =====================
 const isFakePix = process.env.FAKE_PIX === "1";
-const DEBUG_RECS = process.env.DEBUG_RECS === "1";
+const DEBUG_RECO = process.env.DEBUG_RECO === "1";
 
 let mpClient = null;
 if (!isFakePix && process.env.MP_ACCESS_TOKEN) {
@@ -65,7 +65,7 @@ app.get("/api/health", (req, res) =>
     fakePix: isFakePix,
     sheets: !!SHEETS_WEBHOOK_URL,
     corsAllowed: allowedOrigins,
-    debugRecs: DEBUG_RECS,
+    debugReco: DEBUG_RECO,
   })
 );
 
@@ -101,7 +101,7 @@ function withAffiliate(url) {
   }
 }
 
-// util: normaliza (remove acentos e baixa)
+// ===================== Normalização texto (para match robusto) =====================
 function normalizeText(str) {
   return (str || "")
     .toString()
@@ -110,17 +110,15 @@ function normalizeText(str) {
     .replace(/[\u0300-\u036f]/g, "");
 }
 
-// score para keyword: frase inteira ou tokens relevantes
 function kwHitScore(productName, kw, weight) {
   const n = normalizeText(productName);
   const k = normalizeText(kw);
 
   if (!k) return 0;
 
-  // frase inteira -> ganha mais
+  // bate frase inteira -> ganha mais
   if (n.includes(k)) return weight * 1.25;
 
-  // tokens relevantes
   const stop = new Set(["pele", "de", "da", "do", "das", "dos", "para", "com", "sem", "e", "a", "o"]);
   const tokens = k.split(/\s+/).filter((t) => t.length >= 4 && !stop.has(t));
 
@@ -188,9 +186,7 @@ app.post("/api/generate-products", async (req, res) => {
 
     // VTEX legacy search (JSON)
     const SEARCH_API = (q, from = 0, to = 49) =>
-      `${BASE}/api/catalog_system/pub/products/search/?ft=${encodeURIComponent(
-        q
-      )}&O=OrderByBestDiscountDESC&_from=${from}&_to=${to}`;
+      `${BASE}/api/catalog_system/pub/products/search/?ft=${encodeURIComponent(q)}&O=OrderByBestDiscountDESC&_from=${from}&_to=${to}`;
 
     // Fallbacks (skincare/face)
     const FACE_FALLBACK_IMGS = [
@@ -268,17 +264,15 @@ app.post("/api/generate-products", async (req, res) => {
       const has = (arr) => arr.some((k) => n.includes(normalizeText(k)));
 
       if (has(["protetor", "sunscreen", "fps", "spf"])) return "sunscreen";
-      if (has(["gel de limpeza", "limpeza", "cleanser", "sabonte", "sabonete", "cleansing", "demaquilante"]))
-        return "cleanser";
+      if (has(["gel de limpeza", "limpeza", "cleanser", "sabonte", "sabonete", "cleansing", "demaquilante"])) return "cleanser";
       if (has(["hidrat", "moistur", "creme facial"])) return "moisturizer";
-      if (has(["serum", "sérum", "vitamina c", "niacinamida", "retinol", "ácido", "acido", "hialur"]))
-        return "treatment";
-      if (has(["esfol", "peeling", "tônico", "tonico"])) return "exfoliant";
+      if (has(["serum", "serum", "vitamina c", "niacinamida", "retinol", "acido", "hialur"])) return "treatment";
+      if (has(["esfol", "peeling", "tonico", "tônico"])) return "exfoliant";
       if (has(["olhos", "eye"])) return "eye";
       return "other";
     }
 
-    // Orçamento (faixas)
+    // Orçamento
     const BUDGET_BANDS = [
       { label: "Até R$ 60", min: 0, max: 60 },
       { label: "R$ 61 - R$ 120", min: 61, max: 120 },
@@ -290,15 +284,13 @@ app.post("/api/generate-products", async (req, res) => {
 
     function bandIndexFromText(txt) {
       const t = normalizeText(txt);
-
       if (/ate\s*r?\$?\s*60|até\s*r?\$?\s*60|ate\s*60|até\s*60/.test(t)) return 0;
       if (/(61)\s*[-a]\s*(120)/.test(t)) return 1;
       if (/(121)\s*[-a]\s*(200)/.test(t)) return 2;
       if (/(201)\s*[-a]\s*(350)/.test(t)) return 3;
       if (/(351)\s*[-a]\s*(600)/.test(t)) return 4;
       if (/(601)\s*\+|acima\s*de\s*601|mais\s*de\s*601/.test(t)) return 5;
-
-      return 1; // default
+      return 1;
     }
 
     function inBand(price, band) {
@@ -357,20 +349,18 @@ app.post("/api/generate-products", async (req, res) => {
       return data.map(normalizeOpaqueProduct).filter((x) => x && x.nome && x.onde_comprar);
     }
 
-    // ========= answers parsing (robusto) =========
-    const pele = (answers?.pele || answers?.tipoPele || answers?.skinType || "").toString().toLowerCase();
+    // ========= PRIORIDADE: (1) Tipo de pele =========
+    const pele = (answers?.pele || "").toString().toLowerCase();
 
-    const rawInc = answers?.inc ?? answers?.incomodos ?? answers?.incômodos ?? answers?.concerns ?? [];
+    // aceita array (frontend manda array), mas também string, etc.
+    const rawInc = answers?.inc ?? [];
     const inc = Array.isArray(rawInc)
       ? rawInc.map((x) => String(x))
       : typeof rawInc === "string"
       ? rawInc.split(/[;,|]/g).map((s) => s.trim()).filter(Boolean)
-      : typeof rawInc === "object" && rawInc
-      ? Object.values(rawInc).map((x) => String(x))
       : [];
 
     function skinKeywords() {
-      // termos que aparecem em nomes / descrições curtas
       if (pele.includes("oleos")) return ["oleosa", "oleosidade", "matificante", "oil free"];
       if (pele.includes("seca")) return ["seca", "hidratante", "nutritivo", "barreira"];
       if (pele.includes("sens")) return ["sensivel", "calmante", "suave", "sem fragrancia"];
@@ -378,6 +368,7 @@ app.post("/api/generate-products", async (req, res) => {
       return ["normal", "hidratacao leve"];
     }
 
+    // ========= PRIORIDADE: (2) Incômodos =========
     function concernKeywords() {
       const kws = [];
       const txt = (inc || []).join(" ").toLowerCase();
@@ -397,27 +388,21 @@ app.post("/api/generate-products", async (req, res) => {
     const SKIN_KW = skinKeywords();
     const CONCERN_KW = concernKeywords();
 
-    if (DEBUG_RECS) {
-      console.log("[generate-products] answers:", JSON.stringify(answers));
-      console.log("[generate-products] pele:", pele, "| inc:", inc, "| orcamento:", answers?.orcamento);
-      console.log("[generate-products] SKIN_KW:", SKIN_KW, "| CONCERN_KW:", CONCERN_KW);
-    }
-
     // ========= “SLOTS” (sempre 5 produtos) =========
     const SLOT_CATS = [
-      { want: "cleanser", base: "gel de limpeza" },
+      { want: "cleanser", base: "limpeza facial gel de limpeza" },
       { want: "moisturizer", base: "hidratante facial" },
       { want: "sunscreen", base: "protetor solar facial fps" },
       { want: "treatment", base: "serum facial" },
-      { want: "exfoliant", base: "tonico facial" }, // (ou esfoliante)
+      { want: "exfoliant", base: "tonico facial esfoliante" },
     ];
 
-    // Query mais limpa pra VTEX não se perder
+    // Query mais “limpa” (menos poluição = melhor retorno)
     function buildQuery(slotBase) {
       const parts = [];
-      if (SKIN_KW[0]) parts.push(SKIN_KW[0]); // ex: oleosa
-      if (CONCERN_KW[0]) parts.push(CONCERN_KW[0]); // ex: acne
-      parts.push(slotBase);
+      if (SKIN_KW[0]) parts.push(SKIN_KW[0]);         // ex: "oleosa"
+      if (CONCERN_KW[0]) parts.push(CONCERN_KW[0]);   // ex: "acne"
+      parts.push(slotBase);                           // ex: "hidratante facial"
       parts.push("facial");
       return parts.join(" ");
     }
@@ -426,7 +411,7 @@ app.post("/api/generate-products", async (req, res) => {
     const SCORE = {
       skinHit: 6.0,
       concernHit: 3.2,
-      slotHit: 2.8,
+      slotHit: 3.0,
       faceBonus: 2.0,
       outPenalty: -10,
       nonFacePenalty: -8,
@@ -434,13 +419,14 @@ app.post("/api/generate-products", async (req, res) => {
 
     function scoreProduct(p, slot) {
       let s = 0;
-      const name = p.nome || "";
+      const name = p?.nome || "";
       if (isForbidden(name)) return -Infinity;
 
       if (p._out) s += SCORE.outPenalty;
 
       const faceOk = looksFaceProduct(name);
-      s += faceOk ? SCORE.faceBonus : SCORE.nonFacePenalty;
+      if (faceOk) s += SCORE.faceBonus;
+      else s += SCORE.nonFacePenalty;
 
       // Pele (prioridade #1)
       for (const kw of SKIN_KW.slice(0, 3)) s += kwHitScore(name, kw, SCORE.skinHit);
@@ -451,18 +437,23 @@ app.post("/api/generate-products", async (req, res) => {
       // Slot (categoria do produto)
       const want = slot.want;
       const t = classifyType(name);
-
       if (want === "cleanser" && t === "cleanser") s += SCORE.slotHit;
       if (want === "moisturizer" && t === "moisturizer") s += SCORE.slotHit;
       if (want === "sunscreen" && t === "sunscreen") s += SCORE.slotHit;
       if (want === "treatment" && t === "treatment") s += SCORE.slotHit;
       if (want === "exfoliant" && ["exfoliant", "eye"].includes(t)) s += SCORE.slotHit;
 
-      // url/imagem pequenas bonificações
+      // url/imagem
       if (p.onde_comprar && p.onde_comprar.startsWith(BASE + "/")) s += 0.6;
       if (p.foto && isHttps(p.foto)) s += 0.4;
 
       return s;
+    }
+
+    if (DEBUG_RECO) {
+      console.log("[generate-products] answers:", JSON.stringify(answers));
+      console.log("[generate-products] pele:", pele, "| inc:", inc, "| orcamento:", answers?.orcamento);
+      console.log("[generate-products] SKIN_KW:", SKIN_KW, "| CONCERN_KW:", CONCERN_KW);
     }
 
     // ========= 1) Busca por slot =========
@@ -478,16 +469,15 @@ app.post("/api/generate-products", async (req, res) => {
         }))
         .filter((p) => p && p.nome && p.onde_comprar)
         .filter((p) => !isForbidden(p.nome))
-        .filter((p) => !p._out); // evita indisponível
+        .filter((p) => !p._out);
 
       list = list.map((p) => ({ ...p, _score: scoreProduct(p, slot), _slot: slot.want }));
-
       list = list.filter((p) => p._score > -Infinity);
 
-      if (DEBUG_RECS) {
+      if (DEBUG_RECO) {
         console.log("[slot]", slot.want, "query=", q, "items=", list.length);
         console.log(
-          "[slot-top3]",
+          "[slot top]",
           slot.want,
           list
             .slice()
@@ -532,7 +522,7 @@ app.post("/api/generate-products", async (req, res) => {
       note = `Não encontramos 5 produtos na faixa "${fromLabel}". Por isso mostramos opções na próxima faixa: "${toLabel}".`;
     }
 
-    // ========= 4) Seleciona 1 por slot (diversidade), depois completa =========
+    // ========= 4) Seleciona 1 por slot, depois completa =========
     const chosen = [];
     const usedUrls = new Set();
 
@@ -563,12 +553,11 @@ app.post("/api/generate-products", async (req, res) => {
       usedUrls.add(p.onde_comprar);
     }
 
-    // ========= 5) Fallback final, se necessário =========
+    // ========= 5) fallback =========
     let fallbackCursor = 0;
     if (chosen.length < 5) {
-      const fallbackQuery = `${SKIN_KW[0] || ""} ${CONCERN_KW[0] || ""} tratamento facial`.trim();
+      const fallbackQuery = `${SKIN_KW[0] || "pele"} ${CONCERN_KW[0] || ""} tratamento facial`;
       let extra = await opaqueSearch(fallbackQuery);
-
       extra = extra
         .map((x) => ({ ...x, onde_comprar: withAffiliate(x.onde_comprar) }))
         .filter((p) => p && p.nome && p.onde_comprar)
@@ -584,7 +573,7 @@ app.post("/api/generate-products", async (req, res) => {
       }
     }
 
-    // ========= 6) Normaliza e garante 5 itens =========
+    // ========= 6) resposta final =========
     function makeBenefits(p) {
       const n = normalizeText(p.nome);
       const b = [];
@@ -593,7 +582,7 @@ app.post("/api/generate-products", async (req, res) => {
       if (n.includes("vitamina c") || n.includes("niacin") || n.includes("clare")) b.push("Foco em uniformização/manchas");
       if (n.includes("retinol") || n.includes("anti-idade") || n.includes("antissinais")) b.push("Apoio para linhas/idade");
       if (n.includes("oleos") || n.includes("oil")) b.push("Ajuda no controle de oleosidade");
-      if (n.includes("acne") || n.includes("salic")) b.push("Apoio para acne/cravos");
+      if (n.includes("acne") || n.includes("salic") || n.includes("cravo")) b.push("Apoio para acne/cravos");
       if (b.length === 0) b.push("Combina com seu perfil (pele e objetivos)");
       return b.slice(0, 4);
     }
@@ -602,13 +591,10 @@ app.post("/api/generate-products", async (req, res) => {
       const foto = isHttps(p.foto) ? p.foto : FACE_FALLBACK_IMGS[i % FACE_FALLBACK_IMGS.length];
 
       return {
-        id: ("opaque-" + Buffer.from(p.onde_comprar || p.nome || "x").toString("base64")).replace(/=+$/, ""),
+        id: ("opaque-" + Buffer.from(p.onde_comprar || (p.nome || "x")).toString("base64")).replace(/=+$/, ""),
         nome: p.nome || "Produto facial",
         marca: p.marca || "Opaque",
-        preco:
-          p.preco && p.preco > 0
-            ? toBRL(p.preco)
-            : toBRL(Math.max(59.9, BUDGET_BANDS[startBandIdx]?.min || 59.9)),
+        preco: p.preco && p.preco > 0 ? toBRL(p.preco) : toBRL(Math.max(59.9, BUDGET_BANDS[startBandIdx]?.min || 59.9)),
         foto,
         beneficios: makeBenefits(p),
         motivo: "Priorizamos tipo de pele e objetivos informados para sugerir itens coerentes para sua rotina.",
@@ -743,5 +729,5 @@ app.get("/api/img", async (req, res) => {
 // ===================== Start =====================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`API on http://0.0.0.0:${PORT}  |  Fake PIX: ${isFakePix ? "ON" : "OFF"}  |  DEBUG_RECS: ${DEBUG_RECS ? "ON" : "OFF"}`);
+  console.log(`API on http://0.0.0.0:${PORT}  |  Fake PIX: ${isFakePix ? "ON" : "OFF"}`);
 });
