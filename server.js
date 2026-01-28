@@ -314,7 +314,8 @@ app.post("/api/generate-products", async (req, res) => {
       const seller = Array.isArray(item?.sellers) ? item.sellers[0] : null;
       const offer = seller?.commertialOffer || {};
       const price = Number(offer?.Price || offer?.spotPrice || 0);
-      const available = Number(offer?.AvailableQuantity || 0);
+      const availableRaw = offer?.AvailableQuantity;
+      const available = Number.isFinite(Number(availableRaw)) ? Number(availableRaw) : null;
 
       return {
         nome: name,
@@ -322,7 +323,7 @@ app.post("/api/generate-products", async (req, res) => {
         foto: img,
         preco: toBRL(price || 0),
         onde_comprar: url,
-        _out: available === 0,
+        _out: available === 0, // só marca out-of-stock se a VTEX informar 0 explicitamente
         _type: classifyType(name),
       };
     }
@@ -504,23 +505,38 @@ app.post("/api/generate-products", async (req, res) => {
     }
 
     let bandInfo = pickFromBand(chosenBandIdx);
-    while (bandInfo.bandPool.length < 5 && chosenBandIdx < BUDGET_BANDS.length - 1) {
-      chosenBandIdx++;
-      bandInfo = pickFromBand(chosenBandIdx);
-    }
 
-    let finalPool = bandInfo.bandPool;
-    let note = "";
+// Regra de negócio (ajuste):
+// - Se não tiver 5 itens na faixa escolhida, tenta APENAS a próxima faixa imediata.
+// - Se ainda assim não tiver 5, completa com itens fora da faixa (mas mantendo produtos reais).
+if (bandInfo.bandPool.length < 5 && chosenBandIdx < BUDGET_BANDS.length - 1) {
+  chosenBandIdx = chosenBandIdx + 1;
+  bandInfo = pickFromBand(chosenBandIdx);
+}
 
-    if (finalPool.length < 5) {
-      finalPool = poolAll.filter((p) => p.preco > 0);
-    }
+let finalPool = bandInfo.bandPool;
+let note = "";
 
-    if (chosenBandIdx !== startBandIdx) {
-      const fromLabel = BUDGET_BANDS[startBandIdx]?.label || "sua faixa";
-      const toLabel = BUDGET_BANDS[chosenBandIdx]?.label || "faixa acima";
-      note = `Não encontramos 5 produtos na faixa "${fromLabel}". Por isso mostramos opções na próxima faixa: "${toLabel}".`;
-    }
+const fromLabel = BUDGET_BANDS[startBandIdx]?.label || "sua faixa";
+const toLabel = BUDGET_BANDS[chosenBandIdx]?.label || "faixa acima";
+
+if (chosenBandIdx !== startBandIdx) {
+  note = `Não encontramos 5 produtos na faixa "${fromLabel}". Por isso mostramos opções na próxima faixa: "${toLabel}".`;
+}
+
+// Se mesmo na próxima faixa não houver itens suficientes, completa com itens fora da faixa
+// (evita cair em links genéricos de categoria).
+if (finalPool.length < 5) {
+  const extraPool = poolAll.filter((p) => p && p.preco > 0);
+  // mantém a ordem por score, mas dá preferência aos que já estavam no pool da faixa
+  const extraSorted = extraPool.sort((a, b) => b._score - a._score);
+  finalPool = Array.from(new Map([...finalPool, ...extraSorted].map((p) => [p.onde_comprar, p])).values());
+  if (!note) {
+    note = `Não encontramos 5 produtos na faixa "${fromLabel}". Mostramos as melhores opções disponíveis e completamos com itens fora da faixa para fechar 5 recomendações.`;
+  } else {
+    note += " Como ainda não havia 5 itens, completamos com as melhores opções disponíveis fora da faixa.";
+  }
+}
 
     // ========= 4) Seleciona 1 por slot, depois completa =========
     const chosen = [];
@@ -551,6 +567,20 @@ app.post("/api/generate-products", async (req, res) => {
       if (chosen.length >= 5) break;
       chosen.push(p);
       usedUrls.add(p.onde_comprar);
+    }
+
+    // Se ainda faltarem itens (por exemplo, por falta de estoque/preço),
+    // amplia a busca para o pool inteiro (mantendo produtos reais).
+    if (chosen.length < 5) {
+      const broad = poolAll
+        .filter((p) => p && p.onde_comprar && !usedUrls.has(p.onde_comprar))
+        .sort((a, b) => b._score - a._score);
+
+      for (const p of broad) {
+        if (chosen.length >= 5) break;
+        chosen.push(p);
+        usedUrls.add(p.onde_comprar);
+      }
     }
 
     // ========= 5) fallback =========
@@ -598,7 +628,7 @@ app.post("/api/generate-products", async (req, res) => {
         foto,
         beneficios: makeBenefits(p),
         motivo: "Priorizamos tipo de pele e objetivos informados para sugerir itens coerentes para sua rotina.",
-        onde_comprar: p.onde_comprar ? withAffiliate(p.onde_comprar) : withAffiliate(`${BASE}/tratamento/face`),
+        onde_comprar: p.onde_comprar ? withAffiliate(p.onde_comprar) : "",
       };
     });
 
