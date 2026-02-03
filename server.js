@@ -133,33 +133,157 @@ app.post("/api/generate-products", async (req, res) => {
     const { answers } = req.body || {};
     if (!answers) return res.status(400).json({ error: "answers ausente" });
 
-    const BASE = "https://www.opaque.com.br";
+    const BASE = "https://simpleorganic.com.br";
 
-    // ===== Rakuten afiliado =====
-    const RAKUTEN_PARAMS = {
-      utm_source: "rakuten",
-      utm_medium: "afiliados",
-      utm_term: "4587713",
-      ranMID: "47714",
-      ranEAID: "OyPY4YHfHl4",
-      ranSiteID: "OyPY4YHfHl4-5t9np1DoTPuG6fO28twrDA",
+    // ===== Afiliado Simple Organic (Flip) =====
+    const AFFILIATE_PARAMS = {
+      influ: "MYUFITNESS",
+      utm_source: "flipnet",
+      utm_campaign: "MYUFITNESS",
     };
 
-    function addRakutenAffiliate(url) {
+    function addAffiliate(url) {
       try {
         if (!url) return url;
         const u = new URL(url);
-        if (!u.hostname.endsWith("opaque.com.br")) return url;
-        Object.entries(RAKUTEN_PARAMS).forEach(([k, v]) => u.searchParams.set(k, v));
+        if (!u.hostname.endsWith("simpleorganic.com.br")) return url;
+        Object.entries(AFFILIATE_PARAMS).forEach(([k, v]) => u.searchParams.set(k, v));
         return u.toString();
       } catch {
         return url;
       }
     }
 
-    // ===== VTEX Search API =====
-    const SEARCH_API = (q, from = 0, to = 49) =>
-      `${BASE}/api/catalog_system/pub/products/search/?ft=${encodeURIComponent(q)}&O=OrderByBestDiscountDESC&_from=${from}&_to=${to}`;
+    // ===== Busca (HTML) no site Simple Organic =====
+    // Observação: a loja não expõe uma API pública de catálogo como a VTEX.
+    // Por isso, usamos a busca do próprio site e extraímos os produtos do HTML.
+    const SEARCH_URL = (q) => `${BASE}/search?type=product&q=${encodeURIComponent(q)}`;
+
+    function parseBRL(str) {
+      try {
+        const s = (str || "")
+          .toString()
+          .replace(/\u00a0/g, " ")
+          .replace(/[^\d,\.]/g, "")
+          .trim();
+        if (!s) return 0;
+        // casos: "69" | "69,90" | "1.299,90"
+        const normalized = s.includes(",")
+          ? s.replace(/\./g, "").replace(",", ".")
+          : s;
+        const n = Number(normalized);
+        return Number.isFinite(n) ? n : 0;
+      } catch {
+        return 0;
+      }
+    }
+
+    function isSoldOutBlock(block) {
+      const t = (block || "").toLowerCase();
+      return t.includes("esgotado") || t.includes("sold out");
+    }
+
+    function extractFirstPrice(block) {
+      const m = (block || "").match(/R\$\s*[\d\.\,]+/i);
+      return m ? parseBRL(m[0]) : 0;
+    }
+
+    function extractFirstImage(block) {
+      // tenta pegar uma imagem "real" primeiro
+      const img =
+        (block || "").match(/<img[^>]+src="([^"]+)"[^>]*>/i) ||
+        (block || "").match(/data-src="([^"]+)"/i) ||
+        (block || "").match(/srcset="([^"]+)"/i);
+      if (!img) return "";
+      let u = (img[1] || "").trim();
+
+      // se vier srcset, pega o primeiro item
+      if (u.includes(" ")) u = u.split(" ")[0].trim();
+      // normaliza //cdn...
+      if (u.startsWith("//")) u = "https:" + u;
+      return u;
+    }
+
+    function extractName(block) {
+      // prioridade: alt da imagem
+      const alt = (block || "").match(/alt="([^"]+)"/i);
+      if (alt && alt[1]) return alt[1].trim();
+
+      // fallback: primeiro h2/h3
+      const h = (block || "").match(/<(h2|h3)[^>]*>\s*([^<]+)\s*<\/(h2|h3)>/i);
+      if (h && h[2]) return h[2].trim();
+
+      return "";
+    }
+
+    function buildAbsUrl(href) {
+      if (!href) return "";
+      if (/^https?:\/\//i.test(href)) return href;
+      if (href.startsWith("/")) return BASE + href;
+      return BASE + "/" + href;
+    }
+
+    async function simpleSearch(query) {
+      const url = SEARCH_URL(query);
+
+      const r = await fetch(url, {
+        method: "GET",
+        redirect: "follow",
+        headers: {
+          "user-agent": "Mozilla/5.0",
+          accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "accept-language": "pt-BR,pt;q=0.9,en;q=0.8",
+        },
+      });
+
+      if (!r.ok) {
+        console.error("Simple Organic search status:", r.status, url);
+        return [];
+      }
+
+      const html = await r.text().catch(() => "");
+      if (!html) return [];
+
+      // coleta URLs de produtos e um "bloco" próximo para extrair nome/preço/imagem/estoque
+      const out = [];
+      const seen = new Set();
+
+      const re = /href="(\/products\/[^"#\?]+)"/gi;
+      let m;
+      while ((m = re.exec(html)) !== null) {
+        const href = m[1];
+        if (!href) continue;
+
+        const abs = buildAbsUrl(href);
+        const productUrl = addAffiliate(abs);
+
+        if (seen.has(productUrl)) continue;
+        seen.add(productUrl);
+
+        const from = Math.max(0, m.index - 350);
+        const to = Math.min(html.length, m.index + 1200);
+        const block = html.slice(from, to);
+
+        const nome = extractName(block);
+        const foto = extractFirstImage(block);
+        const preco = extractFirstPrice(block);
+        const soldOut = isSoldOutBlock(block);
+
+        out.push({
+          nome: nome || "Produto Simple Organic",
+          marca: "Simple Organic",
+          foto: foto || "",
+          preco: toBRL(preco || 0),
+          onde_comprar: productUrl,
+          _out: soldOut,
+          _type: classifyType(nome),
+        });
+
+        if (out.length >= 60) break; // limite seguro por busca
+      }
+
+      return out.filter((x) => x && x.onde_comprar && x.onde_comprar.includes("simpleorganic.com.br/products/"));
+    }
 
     // fallback images (rotina facial)
     const FACE_FALLBACK_IMGS = [
@@ -228,82 +352,6 @@ app.post("/api/generate-products", async (req, res) => {
       if (has(["sérum","serum","vitamina c","niacin","hialuron"])) return "serum";
       if (has(["tônico","tonico"])) return "toner";
       return "other";
-    }
-
-    function buildProductUrlFromVtex(p) {
-      const linkText = p?.linkText || "";
-      if (linkText) return `${BASE}/${linkText}/p`;
-      const link = p?.link || "";
-      if (link && link.startsWith("http")) return link;
-      return "";
-    }
-
-    // ✅ disponibilidade robusta (VTEX)
-    function getOfferInfo(p) {
-      const item = Array.isArray(p?.items) ? p.items[0] : null;
-      const seller = Array.isArray(item?.sellers) ? item.sellers[0] : null;
-      const offer = seller?.commertialOffer || {};
-      return { item, seller, offer };
-    }
-
-    function normalizeOpaqueProduct(p) {
-      const name = p?.productName || "";
-      const brand = p?.brand || "Opaque";
-
-      const urlRaw = buildProductUrlFromVtex(p);
-      const url = addRakutenAffiliate(urlRaw);
-
-      const { item, offer } = getOfferInfo(p);
-
-      const img = item?.images?.[0]?.imageUrl || "";
-
-      const price = Number(offer?.Price || offer?.spotPrice || 0);
-
-      // ✅ hard stock:
-      // - se IsAvailable existir, ele manda
-      // - se AvailableQuantity existir, >0 = ok
-      // - se nada existir, consideramos disponível (mas ainda pode ser filtrado por score e por tentativa de link)
-      const isAvailFlag = typeof offer?.IsAvailable === "boolean" ? offer.IsAvailable : null;
-      const qty = Number.isFinite(Number(offer?.AvailableQuantity)) ? Number(offer.AvailableQuantity) : null;
-
-      const out =
-        (isAvailFlag === false) ||
-        (qty !== null && qty <= 0);
-
-      return {
-        nome: name,
-        marca: brand,
-        foto: img,
-        preco: toBRL(price || 0),
-        onde_comprar: url,
-        _out: out,
-        _type: classifyType(name),
-      };
-    }
-
-    async function opaqueSearch(query) {
-      const url = SEARCH_API(query, 0, 49);
-
-      const r = await fetch(url, {
-        method: "GET",
-        redirect: "follow",
-        headers: {
-          "user-agent": "Mozilla/5.0",
-          accept: "application/json,text/plain,*/*",
-        },
-      });
-
-      if (!r.ok) {
-        console.error("Opaque API status:", r.status, url);
-        return [];
-      }
-
-      const data = await r.json().catch(() => []);
-      if (!Array.isArray(data)) return [];
-
-      return data
-        .map(normalizeOpaqueProduct)
-        .filter((x) => x && x.nome && x.onde_comprar && x.onde_comprar.includes("opaque.com.br/"));
     }
 
     // ===== Respostas =====
@@ -388,7 +436,7 @@ app.post("/api/generate-products", async (req, res) => {
 
       if (p.foto && isHttps(p.foto)) s += 0.6;
       if (p.marca) s += 0.25;
-      if (p.onde_comprar && p.onde_comprar.includes("opaque.com.br/")) s += 0.6;
+      if (p.onde_comprar && p.onde_comprar.includes("simpleorganic.com.br/")) s += 0.6;
 
       return s;
     }
@@ -401,7 +449,7 @@ app.post("/api/generate-products", async (req, res) => {
 
       let agg = [];
       for (const q of tries) {
-        const lst = await opaqueSearch(q);
+        const lst = await simpleSearch(q);
 
         // ✅ remove proibidos e indisponíveis já aqui
         const filtered = lst
@@ -513,28 +561,28 @@ app.post("/api/generate-products", async (req, res) => {
       const preco = p.preco && p.preco > 0 ? toBRL(p.preco) : toBRL(Math.max(39.9, BUDGET_MIN || 39.9));
 
       return {
-        id: ("opaque-" + Buffer.from(p.onde_comprar).toString("base64")).replace(/=+$/, ""),
+        id: ("simple-" + Buffer.from(p.onde_comprar).toString("base64")).replace(/=+$/, ""),
         nome: p.nome,
-        marca: p.marca || "Opaque",
+        marca: p.marca || "Simple Organic",
         preco,
         foto,
         beneficios: makeBenefits(p),
         motivo: "Selecionado para montar uma rotina facial completa (limpeza, hidratação, proteção e tratamento), respeitando seu perfil e orçamento.",
-        onde_comprar: addRakutenAffiliate(p.onde_comprar),
+        onde_comprar: addAffiliate(p.onde_comprar),
       };
     });
 
     // ✅ fallback só se realmente não tiver nenhum produto
-    const fallbackUrl = addRakutenAffiliate(`${BASE}/tratamento/face`);
+    const fallbackUrl = addAffiliate(`${BASE}/collections/shop-all`);
     while (top5.length < 5) {
       top5.push({
-        id: "opaque-face-" + (top5.length + 1),
-        nome: "Sugestões em Tratamento Facial (Opaque)",
-        marca: "Opaque",
+        id: "simple-shopall-" + (top5.length + 1),
+        nome: "Sugestões em Shop All (Simple Organic)",
+        marca: "Simple Organic",
         preco: toBRL(Math.max(39.9, BUDGET_MIN || 39.9)),
         foto: FACE_FALLBACK_IMGS[top5.length % FACE_FALLBACK_IMGS.length],
         beneficios: ["Veja mais opções disponíveis no site"],
-        motivo: "Não encontramos itens suficientes no momento; veja opções na categoria de tratamento facial.",
+        motivo: "Não encontramos itens suficientes no momento; veja opções na coleção completa.",
         onde_comprar: fallbackUrl,
       });
     }
@@ -542,11 +590,11 @@ app.post("/api/generate-products", async (req, res) => {
     return res.json({ products: top5.slice(0, 5) });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ error: "Falha ao gerar produtos (OPAQUE FACE)" });
+    return res.status(500).json({ error: "Falha ao gerar produtos (SIMPLE ORGANIC)" });
   }
 });
 
-// ===================== PIX: criar cobrança (FAKE ou REAL) =====================
+
 app.post("/api/create-pix", async (req, res) => {
   try {
     const body = req.body || {};
