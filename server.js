@@ -1,8 +1,8 @@
-// server.js (CommonJS) — Produção: OPAQUE (Face) + PIX (FAKE opcional) + Proxy Imagens + Leads (Google Sheets)
-// vFinal: (1) exclui indisponíveis de verdade (IsAvailable/AvailableQuantity)
-//         (2) busca mais resultados e tenta consultas mais amplas por slot
-//         (3) evita cair em /tratamento/face (fallback) quando ainda há produtos reais disponíveis
-//         (4) aplica afiliado Rakuten em TODOS os links
+// server.js (CommonJS) — Produção: SIMPLE ORGANIC + PIX (FAKE opcional) + Proxy Imagens + Leads (Google Sheets)
+// vCorrigida: (1) remove erro de sintaxe (try sem catch)  (2) busca produtos via Shopify JSON (suggest + product.js)
+//            (3) remove fallback "shop-all" que gerava preço/imagem errados
+//            (4) aplica afiliado Flip (MYUFITNESS) em TODOS os links
+
 require("dotenv").config({ path: require("path").join(__dirname, ".env") });
 
 const express = require("express");
@@ -13,7 +13,7 @@ const rateLimit = require("express-rate-limit");
 const mercadopago = require("mercadopago");
 const { MercadoPagoConfig, Payment } = mercadopago;
 
-// OpenAI (mantido por compatibilidade)
+// OpenAI (mantido por compatibilidade com seu projeto; não é usado aqui)
 const OpenAI = require("openai");
 
 const app = express();
@@ -127,7 +127,7 @@ app.post("/api/save-lead", async (req, res) => {
   }
 });
 
-// ===================== Geração: Busca OPAQUE (Face) =====================
+// ===================== Geração: Busca SIMPLE ORGANIC =====================
 app.post("/api/generate-products", async (req, res) => {
   try {
     const { answers } = req.body || {};
@@ -141,16 +141,17 @@ app.post("/api/generate-products", async (req, res) => {
       utm_source: "flipnet",
       utm_campaign: "MYUFITNESS",
     };
+
     function addAffiliate(url) {
       try {
         if (!url) return url;
         const u = new URL(url);
         if (!u.hostname.endsWith("simpleorganic.com.br")) return url;
 
-        // garante parâmetros do afiliado (padrão Flip)
+        // garante parâmetros do afiliado
         Object.entries(AFFILIATE_PARAMS).forEach(([k, v]) => u.searchParams.set(k, v));
 
-        // remove parâmetros legados que possam confundir
+        // remove parâmetros legados
         u.searchParams.delete("utm_content");
 
         return u.toString();
@@ -159,105 +160,113 @@ app.post("/api/generate-products", async (req, res) => {
       }
     }
 
+    // ===== Busca (Shopify JSON) no site Simple Organic =====
+    // 1) suggest.json (predictive search)
+    // 2) /products/<handle>.js (detalhes: preço, imagem, disponibilidade)
+    const SUGGEST_URL = (q) =>
+      `${BASE}/search/suggest.json?q=${encodeURIComponent(
+        q
+      )}&resources[type]=product&resources[limit]=20&resources[options][unavailable_products]=hide`;
+
+    const productCache = new Map(); // handle -> productObj
+
+    function normalizeImg(u) {
+      if (!u) return "";
+      let s = (u || "").toString().trim();
+      if (s.startsWith("//")) s = "https:" + s;
+      return s;
     }
 
-    // ===== Busca (Shopify JSON) no site Simple Organic =====
-// A Simple Organic roda em Shopify. Para evitar "preço/imagem errados" (ou fallback), usamos:
-// 1) predictive search JSON: /search/suggest.json
-// 2) detalhes do produto JSON: /products/<handle>.js
+    async function fetchJson(url) {
+      const r = await fetch(url, {
+        method: "GET",
+        redirect: "follow",
+        headers: {
+          "user-agent": "Mozilla/5.0",
+          accept: "application/json, text/plain, */*",
+          "accept-language": "pt-BR,pt;q=0.9,en;q=0.8",
+        },
+      });
+      if (!r.ok) return null;
+      try {
+        return await r.json();
+      } catch {
+        return null;
+      }
+    }
 
-const SUGGEST_URL = (q) =>
-  `${BASE}/search/suggest.json?q=${encodeURIComponent(q)}&resources[type]=product&resources[limit]=20&resources[options][unavailable_products]=hide`;
+    function classifyType(name) {
+      const n = (name || "").toLowerCase();
+      const has = (arr) => arr.some((k) => n.includes(k));
+      if (has(["protetor solar", "fps", "sunscreen", "solar"])) return "sunscreen";
+      if (has(["limpador", "limpeza", "sabonete", "gel de limpeza", "espuma", "agua micelar", "água micelar"]))
+        return "cleanser";
+      if (has(["hidratante", "hidratação", "hidratacao", "moisturizer"])) return "moisturizer";
+      if (has(["esfoliante", "esfoliação", "esfoliacao", "peeling", "scrub"])) return "exfoliant";
+      if (has(["sérum", "serum", "vitamina c", "niacin", "hialuron"])) return "serum";
+      if (has(["tônico", "tonico"])) return "toner";
+      return "other";
+    }
 
-const productCache = new Map(); // handle -> productObj
+    async function getProductByHandle(handle) {
+      if (!handle) return null;
+      if (productCache.has(handle)) return productCache.get(handle);
 
-function normalizeImg(u) {
-  if (!u) return "";
-  let s = (u || "").toString().trim();
-  if (s.startsWith("//")) s = "https:" + s;
-  return s;
-}
+      const url = `${BASE}/products/${handle}.js`;
+      const j = await fetchJson(url);
+      if (!j || !j.handle) return null;
 
-async function fetchJson(url) {
-  const r = await fetch(url, {
-    method: "GET",
-    redirect: "follow",
-    headers: {
-      "user-agent": "Mozilla/5.0",
-      accept: "application/json, text/plain, */*",
-      "accept-language": "pt-BR,pt;q=0.9,en;q=0.8",
-    },
-  });
-  if (!r.ok) return null;
-  try {
-    return await r.json();
-  } catch {
-    return null;
-  }
-}
+      const variants = Array.isArray(j.variants) ? j.variants : [];
+      const chosenVar = variants.find((v) => v && v.available) || variants[0] || null;
 
-async function getProductByHandle(handle) {
-  if (!handle) return null;
-  if (productCache.has(handle)) return productCache.get(handle);
+      const price = chosenVar && typeof chosenVar.price === "number" ? chosenVar.price / 100 : 0;
+      const available = !!(chosenVar ? chosenVar.available : true);
 
-  const url = `${BASE}/products/${handle}.js`;
-  const j = await fetchJson(url);
-  if (!j || !j.handle) return null;
+      const obj = {
+        nome: (j.title || "Produto Simple Organic").toString(),
+        marca: "Simple Organic",
+        foto: normalizeImg(j.featured_image || (Array.isArray(j.images) ? j.images[0] : "")),
+        preco: toBRL(price || 0),
+        onde_comprar: addAffiliate(`${BASE}/products/${j.handle}`),
+        _out: !available,
+        _type: classifyType(j.title || ""),
+      };
 
-  const variants = Array.isArray(j.variants) ? j.variants : [];
-  const chosenVar = variants.find((v) => v && v.available) || variants[0] || null;
+      productCache.set(handle, obj);
+      return obj;
+    }
 
-  const price = chosenVar && typeof chosenVar.price === "number" ? chosenVar.price / 100 : 0;
-  const available = !!(chosenVar ? chosenVar.available : true);
+    async function suggestHandles(query) {
+      const url = SUGGEST_URL(query);
+      const j = await fetchJson(url);
 
-  const obj = {
-    nome: (j.title || "Produto Simple Organic").toString(),
-    marca: "Simple Organic",
-    foto: normalizeImg(j.featured_image || (Array.isArray(j.images) ? j.images[0] : "")),
-    preco: toBRL(price || 0),
-    onde_comprar: addAffiliate(`${BASE}/products/${j.handle}`),
-    _out: !available,
-    _type: classifyType(j.title || ""),
-  };
+      const products =
+        j?.resources?.results?.products ||
+        j?.resources?.results?.product ||
+        j?.results?.products ||
+        [];
 
-  productCache.set(handle, obj);
-  return obj;
-}
+      const handles = [];
+      for (const p of products) {
+        const handle = (p && (p.handle || p?.url?.split("/products/")[1] || "")).toString().trim();
+        if (!handle) continue;
+        handles.push(handle.split("?")[0].split("#")[0]);
+      }
+      return Array.from(new Set(handles));
+    }
 
-async function suggestHandles(query) {
-  const url = SUGGEST_URL(query);
-  const j = await fetchJson(url);
-  const products =
-    j?.resources?.results?.products ||
-    j?.resources?.results?.product ||
-    j?.results?.products ||
-    [];
+    async function simpleSearch(query) {
+      const handles = await suggestHandles(query);
+      const out = [];
+      for (const h of handles) {
+        const p = await getProductByHandle(h);
+        if (p) out.push(p);
+        if (out.length >= 40) break;
+      }
+      return out;
+    }
 
-  // Normaliza para uma lista de handles
-  const handles = [];
-  for (const p of products) {
-    const handle = (p && (p.handle || p?.url?.split("/products/")[1] || "")).toString().trim();
-    if (!handle) continue;
-    handles.push(handle.split("?")[0].split("#")[0]);
-  }
-
-  return Array.from(new Set(handles));
-}
-
-async function simpleSearch(query) {
-  // 1) tentativa via suggest.json
-  const handles = await suggestHandles(query);
-  const out = [];
-  for (const h of handles) {
-    const p = await getProductByHandle(h);
-    if (p) out.push(p);
-    if (out.length >= 40) break;
-  }
-  return out;
-}
-
-
-// fallback images (rotina facial)
+    // fallback images (rotina facial)
     const FACE_FALLBACK_IMGS = [
       "https://images.pexels.com/photos/3762879/pexels-photo-3762879.jpeg?auto=compress&cs=tinysrgb&w=800",
       "https://images.pexels.com/photos/6621457/pexels-photo-6621457.jpeg?auto=compress&cs=tinysrgb&w=800",
@@ -267,17 +276,62 @@ async function simpleSearch(query) {
     ];
 
     const FORBIDDEN_TERMS = [
-      "infantil","infantis","baby","bebê","bebe","crianca","criança","kids","menino","menina","pediátric","pediatric","júnior","junior"
+      "infantil",
+      "infantis",
+      "baby",
+      "bebê",
+      "bebe",
+      "crianca",
+      "criança",
+      "kids",
+      "menino",
+      "menina",
+      "pediátric",
+      "pediatric",
+      "júnior",
+      "junior",
     ];
 
     // palavras-chave face / skincare
     const FACE_KEYWORDS = [
-      "limpador","limpeza","cleanser","sabonete","gel de limpeza","espuma","água micelar","agua micelar",
-      "hidratante","hidratação","hidratacao","moisturizer","creme","gel creme",
-      "esfoliante","esfoliação","esfoliacao","scrub","peeling",
-      "protetor","protetor solar","fps","sunscreen","solar",
-      "sérum","serum","vitamina c","niacinamida","ácido","acido","hialurônico","hialuronico",
-      "tônico","tonico","máscara","mascara","face","facial"
+      "limpador",
+      "limpeza",
+      "cleanser",
+      "sabonete",
+      "gel de limpeza",
+      "espuma",
+      "água micelar",
+      "agua micelar",
+      "hidratante",
+      "hidratação",
+      "hidratacao",
+      "moisturizer",
+      "creme",
+      "gel creme",
+      "esfoliante",
+      "esfoliação",
+      "esfoliacao",
+      "scrub",
+      "peeling",
+      "protetor",
+      "protetor solar",
+      "fps",
+      "sunscreen",
+      "solar",
+      "sérum",
+      "serum",
+      "vitamina c",
+      "niacinamida",
+      "ácido",
+      "acido",
+      "hialurônico",
+      "hialuronico",
+      "tônico",
+      "tonico",
+      "máscara",
+      "mascara",
+      "face",
+      "facial",
     ];
 
     function isForbidden(name) {
@@ -294,11 +348,13 @@ async function simpleSearch(query) {
       return Number.isFinite(price) && price >= min && price <= max;
     }
 
-    // faixas detalhadas (se o front ainda estiver com antigas, também funciona)
+    // faixas detalhadas (inclui "Até R$ 60")
     function parseBudgetRange(txt) {
       const t = (txt || "").toLowerCase();
-      if (t.includes("até r$ 50") || t.includes("ate r$ 50") || t.includes("até 50") || t.includes("ate 50")) return [0, 50];
-      if (t.includes("até r$ 60") || t.includes("ate r$ 60") || t.includes("até 60") || t.includes("ate 60")) return [0, 60];
+      if (t.includes("até r$ 50") || t.includes("ate r$ 50") || t.includes("até 50") || t.includes("ate 50"))
+        return [0, 50];
+      if (t.includes("até r$ 60") || t.includes("ate r$ 60") || t.includes("até 60") || t.includes("ate 60"))
+        return [0, 60];
       if (t.includes("51") && t.includes("60")) return [51, 60];
       if (t.includes("61") && t.includes("80")) return [61, 80];
       if (t.includes("81") && t.includes("150")) return [81, 150];
@@ -308,7 +364,8 @@ async function simpleSearch(query) {
       if (t.includes("351") || t.includes("acima") || t.includes("mais de")) return [351, 9999];
 
       // compat antigo
-      if (t.includes("até r$ 80") || t.includes("ate r$ 80") || t.includes("até 80") || t.includes("ate 80")) return [0, 80];
+      if (t.includes("até r$ 80") || t.includes("ate r$ 80") || t.includes("até 80") || t.includes("ate 80"))
+        return [0, 80];
       if (t.includes("81") || t.includes("r$ 81") || t.includes("81 - 150")) return [81, 150];
       if (t.includes("151") || t.includes("r$ 151") || t.includes("151 - 250")) return [151, 250];
       if (t.includes("251") || t.includes("r$ 251")) return [251, 9999];
@@ -316,20 +373,8 @@ async function simpleSearch(query) {
       return [0, 9999];
     }
 
-    function classifyType(name) {
-      const n = (name || "").toLowerCase();
-      const has = (arr) => arr.some((k) => n.includes(k));
-      if (has(["protetor solar","fps","sunscreen","solar"])) return "sunscreen";
-      if (has(["limpador","limpeza","sabonete","gel de limpeza","espuma","agua micelar","água micelar"])) return "cleanser";
-      if (has(["hidratante","hidratação","hidratacao","moisturizer"])) return "moisturizer";
-      if (has(["esfoliante","esfoliação","esfoliacao","peeling","scrub"])) return "exfoliant";
-      if (has(["sérum","serum","vitamina c","niacin","hialuron"])) return "serum";
-      if (has(["tônico","tonico"])) return "toner";
-      return "other";
-    }
-
     // ===== Respostas =====
-    const pele = (answers?.pele || "").toLowerCase(); // oleosa / seca / mista / sensível
+    const pele = (answers?.pele || "").toLowerCase(); // oleosa / seca / mista / sensível / normal
     const sensibilidade = (answers?.sensibilidade || "").toLowerCase();
     const inc = Array.isArray(answers?.inc) ? answers.inc : [];
     const incTxt = inc.join(" ").toLowerCase();
@@ -344,6 +389,7 @@ async function simpleSearch(query) {
       if (pele.includes("seca")) parts.push("pele seca");
       if (pele.includes("mista")) parts.push("pele mista");
       if (pele.includes("sens") || sensibilidade.includes("sim")) parts.push("pele sensível");
+      if (pele.includes("normal")) parts.push("pele normal");
 
       if (incTxt.includes("acne")) parts.push("acne");
       if (incTxt.includes("manchas")) parts.push("manchas");
@@ -354,7 +400,7 @@ async function simpleSearch(query) {
       return parts.join(" ");
     }
 
-    // ✅ para cada slot, tentamos “ampliar” a busca se vier poucos resultados
+    // para cada slot, tentamos “ampliar” a busca se vier poucos resultados
     function slotQueries(cat) {
       const q1 = buildQueryBase(cat);
       const q2 = `${cat} facial`;
@@ -364,13 +410,7 @@ async function simpleSearch(query) {
       return [q1, q2, q3, q5, q4];
     }
 
-    const mix = [
-      "limpador",
-      "hidratante",
-      "protetor solar",
-      "serum",
-      "esfoliante",
-    ];
+    const mix = ["limpador", "hidratante", "protetor solar", "serum", "esfoliante"];
 
     const [BUDGET_MIN, BUDGET_MAX] = parseBudgetRange(answers?.orcamento);
 
@@ -379,8 +419,6 @@ async function simpleSearch(query) {
       const name = (p.nome || "").toLowerCase();
 
       if (isForbidden(name)) return -Infinity;
-
-      // ✅ indisponível = elimina
       if (p._out) return -Infinity;
 
       // tem que ser face/skincare
@@ -396,9 +434,13 @@ async function simpleSearch(query) {
       // sinais por perfil
       if (pele.includes("oleos") && (name.includes("oil") || name.includes("oleos") || name.includes("controle"))) s += 1.2;
       if (pele.includes("seca") && (name.includes("hidrat") || name.includes("hialur") || name.includes("nutri"))) s += 1.2;
+      if (pele.includes("normal") && (name.includes("equilib") || name.includes("balance") || name.includes("suave")))
+        s += 0.6;
+
       if (incTxt.includes("acne") && (name.includes("acne") || name.includes("salic"))) s += 1.2;
       if (incTxt.includes("manchas") && (name.includes("vitamina c") || name.includes("niacin") || name.includes("clare"))) s += 1.0;
-      if ((pele.includes("sens") || sensibilidade.includes("sim")) && (name.includes("sens") || name.includes("suave") || name.includes("calm"))) s += 1.0;
+      if ((pele.includes("sens") || sensibilidade.includes("sim")) && (name.includes("sens") || name.includes("suave") || name.includes("calm")))
+        s += 1.0;
 
       // orçamento
       if (p.preco > 0) {
@@ -425,7 +467,6 @@ async function simpleSearch(query) {
       for (const q of tries) {
         const lst = await simpleSearch(q);
 
-        // ✅ remove proibidos e indisponíveis já aqui
         const filtered = lst
           .filter((p) => p && p.nome)
           .filter((p) => !isForbidden(p.nome))
@@ -433,11 +474,9 @@ async function simpleSearch(query) {
 
         agg.push(...filtered);
 
-        // se já tem bastante pro slot, para
         if (agg.length >= 20) break;
       }
 
-      // score e adiciona
       agg.forEach((p) => {
         results.push({
           ...p,
@@ -447,10 +486,9 @@ async function simpleSearch(query) {
       });
     }
 
-    // remove -Infinity
     const valid = results.filter((p) => Number.isFinite(p._score) && p._score > -1e9);
 
-    // ===== Lógica de orçamento (com fallback que NÃO vira categoria tão cedo) =====
+    // ===== Lógica de orçamento (sem fallback "shop-all") =====
     let pool = valid.filter((p) => (p.preco > 0 ? inBudget(p.preco, BUDGET_MIN, BUDGET_MAX) : true));
 
     if (pool.length < 20) {
@@ -460,13 +498,11 @@ async function simpleSearch(query) {
     }
 
     if (pool.length < 5) {
-      // aceita abaixo do máximo
       pool = valid.filter((p) => (p.preco > 0 ? p.preco <= BUDGET_MAX : true));
     }
 
     if (pool.length < 5) {
-      // remove filtro preço
-      pool = valid;
+      pool = valid; // último recurso: sem filtro de preço
     }
 
     // ordena e tira duplicatas por URL
@@ -488,11 +524,9 @@ async function simpleSearch(query) {
       const preferred = preferredTypesBySlot[slotIdx] || new Set();
       const candidates = list
         .filter((p) => !chosenUrls.has(p.onde_comprar))
-        .filter((p) => !p._out); // redundância segura
+        .filter((p) => !p._out);
 
-      const bestPreferred = candidates
-        .filter((p) => preferred.has(p._type))
-        .sort((a, b) => b._score - a._score);
+      const bestPreferred = candidates.filter((p) => preferred.has(p._type)).sort((a, b) => b._score - a._score);
 
       return bestPreferred[0] || candidates.sort((a, b) => b._score - a._score)[0] || null;
     }
@@ -532,7 +566,7 @@ async function simpleSearch(query) {
 
     const top5 = chosen.slice(0, 5).map((p, i) => {
       const foto = isHttps(p.foto) ? p.foto : FACE_FALLBACK_IMGS[i % FACE_FALLBACK_IMGS.length];
-            const preco = p.preco && p.preco > 0 ? toBRL(p.preco) : 0;
+      const preco = p.preco && p.preco > 0 ? toBRL(p.preco) : 0;
 
       return {
         id: ("simple-" + Buffer.from(p.onde_comprar).toString("base64")).replace(/=+$/, ""),
@@ -541,7 +575,8 @@ async function simpleSearch(query) {
         preco,
         foto,
         beneficios: makeBenefits(p),
-        motivo: "Selecionado para montar uma rotina facial completa (limpeza, hidratação, proteção e tratamento), respeitando seu perfil e orçamento.",
+        motivo:
+          "Selecionado para montar uma rotina facial completa (limpeza, hidratação, proteção e tratamento), respeitando seu perfil e orçamento.",
         onde_comprar: addAffiliate(p.onde_comprar),
       };
     });
@@ -553,7 +588,7 @@ async function simpleSearch(query) {
   }
 });
 
-
+// ===================== PIX: criar =====================
 app.post("/api/create-pix", async (req, res) => {
   try {
     const body = req.body || {};
