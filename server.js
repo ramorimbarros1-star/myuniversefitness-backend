@@ -141,151 +141,123 @@ app.post("/api/generate-products", async (req, res) => {
       utm_source: "flipnet",
       utm_campaign: "MYUFITNESS",
     };
-
     function addAffiliate(url) {
       try {
         if (!url) return url;
         const u = new URL(url);
         if (!u.hostname.endsWith("simpleorganic.com.br")) return url;
+
+        // garante parâmetros do afiliado (padrão Flip)
         Object.entries(AFFILIATE_PARAMS).forEach(([k, v]) => u.searchParams.set(k, v));
+
+        // remove parâmetros legados que possam confundir
+        u.searchParams.delete("utm_content");
+
         return u.toString();
       } catch {
         return url;
       }
     }
 
-    // ===== Busca (HTML) no site Simple Organic =====
-    // Observação: a loja não expõe uma API pública de catálogo como a VTEX.
-    // Por isso, usamos a busca do próprio site e extraímos os produtos do HTML.
-    const SEARCH_URL = (q) => `${BASE}/search?type=product&q=${encodeURIComponent(q)}`;
-
-    function parseBRL(str) {
-      try {
-        const s = (str || "")
-          .toString()
-          .replace(/\u00a0/g, " ")
-          .replace(/[^\d,\.]/g, "")
-          .trim();
-        if (!s) return 0;
-        // casos: "69" | "69,90" | "1.299,90"
-        const normalized = s.includes(",")
-          ? s.replace(/\./g, "").replace(",", ".")
-          : s;
-        const n = Number(normalized);
-        return Number.isFinite(n) ? n : 0;
-      } catch {
-        return 0;
-      }
     }
 
-    function isSoldOutBlock(block) {
-      const t = (block || "").toLowerCase();
-      return t.includes("esgotado") || t.includes("sold out");
-    }
+    // ===== Busca (Shopify JSON) no site Simple Organic =====
+// A Simple Organic roda em Shopify. Para evitar "preço/imagem errados" (ou fallback), usamos:
+// 1) predictive search JSON: /search/suggest.json
+// 2) detalhes do produto JSON: /products/<handle>.js
 
-    function extractFirstPrice(block) {
-      const m = (block || "").match(/R\$\s*[\d\.\,]+/i);
-      return m ? parseBRL(m[0]) : 0;
-    }
+const SUGGEST_URL = (q) =>
+  `${BASE}/search/suggest.json?q=${encodeURIComponent(q)}&resources[type]=product&resources[limit]=20&resources[options][unavailable_products]=hide`;
 
-    function extractFirstImage(block) {
-      // tenta pegar uma imagem "real" primeiro
-      const img =
-        (block || "").match(/<img[^>]+src="([^"]+)"[^>]*>/i) ||
-        (block || "").match(/data-src="([^"]+)"/i) ||
-        (block || "").match(/srcset="([^"]+)"/i);
-      if (!img) return "";
-      let u = (img[1] || "").trim();
+const productCache = new Map(); // handle -> productObj
 
-      // se vier srcset, pega o primeiro item
-      if (u.includes(" ")) u = u.split(" ")[0].trim();
-      // normaliza //cdn...
-      if (u.startsWith("//")) u = "https:" + u;
-      return u;
-    }
+function normalizeImg(u) {
+  if (!u) return "";
+  let s = (u || "").toString().trim();
+  if (s.startsWith("//")) s = "https:" + s;
+  return s;
+}
 
-    function extractName(block) {
-      // prioridade: alt da imagem
-      const alt = (block || "").match(/alt="([^"]+)"/i);
-      if (alt && alt[1]) return alt[1].trim();
+async function fetchJson(url) {
+  const r = await fetch(url, {
+    method: "GET",
+    redirect: "follow",
+    headers: {
+      "user-agent": "Mozilla/5.0",
+      accept: "application/json, text/plain, */*",
+      "accept-language": "pt-BR,pt;q=0.9,en;q=0.8",
+    },
+  });
+  if (!r.ok) return null;
+  try {
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
 
-      // fallback: primeiro h2/h3
-      const h = (block || "").match(/<(h2|h3)[^>]*>\s*([^<]+)\s*<\/(h2|h3)>/i);
-      if (h && h[2]) return h[2].trim();
+async function getProductByHandle(handle) {
+  if (!handle) return null;
+  if (productCache.has(handle)) return productCache.get(handle);
 
-      return "";
-    }
+  const url = `${BASE}/products/${handle}.js`;
+  const j = await fetchJson(url);
+  if (!j || !j.handle) return null;
 
-    function buildAbsUrl(href) {
-      if (!href) return "";
-      if (/^https?:\/\//i.test(href)) return href;
-      if (href.startsWith("/")) return BASE + href;
-      return BASE + "/" + href;
-    }
+  const variants = Array.isArray(j.variants) ? j.variants : [];
+  const chosenVar = variants.find((v) => v && v.available) || variants[0] || null;
 
-    async function simpleSearch(query) {
-      const url = SEARCH_URL(query);
+  const price = chosenVar && typeof chosenVar.price === "number" ? chosenVar.price / 100 : 0;
+  const available = !!(chosenVar ? chosenVar.available : true);
 
-      const r = await fetch(url, {
-        method: "GET",
-        redirect: "follow",
-        headers: {
-          "user-agent": "Mozilla/5.0",
-          accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          "accept-language": "pt-BR,pt;q=0.9,en;q=0.8",
-        },
-      });
+  const obj = {
+    nome: (j.title || "Produto Simple Organic").toString(),
+    marca: "Simple Organic",
+    foto: normalizeImg(j.featured_image || (Array.isArray(j.images) ? j.images[0] : "")),
+    preco: toBRL(price || 0),
+    onde_comprar: addAffiliate(`${BASE}/products/${j.handle}`),
+    _out: !available,
+    _type: classifyType(j.title || ""),
+  };
 
-      if (!r.ok) {
-        console.error("Simple Organic search status:", r.status, url);
-        return [];
-      }
+  productCache.set(handle, obj);
+  return obj;
+}
 
-      const html = await r.text().catch(() => "");
-      if (!html) return [];
+async function suggestHandles(query) {
+  const url = SUGGEST_URL(query);
+  const j = await fetchJson(url);
+  const products =
+    j?.resources?.results?.products ||
+    j?.resources?.results?.product ||
+    j?.results?.products ||
+    [];
 
-      // coleta URLs de produtos e um "bloco" próximo para extrair nome/preço/imagem/estoque
-      const out = [];
-      const seen = new Set();
+  // Normaliza para uma lista de handles
+  const handles = [];
+  for (const p of products) {
+    const handle = (p && (p.handle || p?.url?.split("/products/")[1] || "")).toString().trim();
+    if (!handle) continue;
+    handles.push(handle.split("?")[0].split("#")[0]);
+  }
 
-      const re = /href="(\/products\/[^"#\?]+)"/gi;
-      let m;
-      while ((m = re.exec(html)) !== null) {
-        const href = m[1];
-        if (!href) continue;
+  return Array.from(new Set(handles));
+}
 
-        const abs = buildAbsUrl(href);
-        const productUrl = addAffiliate(abs);
+async function simpleSearch(query) {
+  // 1) tentativa via suggest.json
+  const handles = await suggestHandles(query);
+  const out = [];
+  for (const h of handles) {
+    const p = await getProductByHandle(h);
+    if (p) out.push(p);
+    if (out.length >= 40) break;
+  }
+  return out;
+}
 
-        if (seen.has(productUrl)) continue;
-        seen.add(productUrl);
 
-        const from = Math.max(0, m.index - 350);
-        const to = Math.min(html.length, m.index + 1200);
-        const block = html.slice(from, to);
-
-        const nome = extractName(block);
-        const foto = extractFirstImage(block);
-        const preco = extractFirstPrice(block);
-        const soldOut = isSoldOutBlock(block);
-
-        out.push({
-          nome: nome || "Produto Simple Organic",
-          marca: "Simple Organic",
-          foto: foto || "",
-          preco: toBRL(preco || 0),
-          onde_comprar: productUrl,
-          _out: soldOut,
-          _type: classifyType(nome),
-        });
-
-        if (out.length >= 60) break; // limite seguro por busca
-      }
-
-      return out.filter((x) => x && x.onde_comprar && x.onde_comprar.includes("simpleorganic.com.br/products/"));
-    }
-
-    // fallback images (rotina facial)
+// fallback images (rotina facial)
     const FACE_FALLBACK_IMGS = [
       "https://images.pexels.com/photos/3762879/pexels-photo-3762879.jpeg?auto=compress&cs=tinysrgb&w=800",
       "https://images.pexels.com/photos/6621457/pexels-photo-6621457.jpeg?auto=compress&cs=tinysrgb&w=800",
@@ -326,7 +298,9 @@ app.post("/api/generate-products", async (req, res) => {
     function parseBudgetRange(txt) {
       const t = (txt || "").toLowerCase();
       if (t.includes("até r$ 50") || t.includes("ate r$ 50") || t.includes("até 50") || t.includes("ate 50")) return [0, 50];
-      if (t.includes("51") && t.includes("80")) return [51, 80];
+      if (t.includes("até r$ 60") || t.includes("ate r$ 60") || t.includes("até 60") || t.includes("ate 60")) return [0, 60];
+      if (t.includes("51") && t.includes("60")) return [51, 60];
+      if (t.includes("61") && t.includes("80")) return [61, 80];
       if (t.includes("81") && t.includes("150")) return [81, 150];
       if (t.includes("151") && t.includes("200")) return [151, 200];
       if (t.includes("201") && t.includes("250")) return [201, 250];
@@ -558,7 +532,7 @@ app.post("/api/generate-products", async (req, res) => {
 
     const top5 = chosen.slice(0, 5).map((p, i) => {
       const foto = isHttps(p.foto) ? p.foto : FACE_FALLBACK_IMGS[i % FACE_FALLBACK_IMGS.length];
-      const preco = p.preco && p.preco > 0 ? toBRL(p.preco) : toBRL(Math.max(39.9, BUDGET_MIN || 39.9));
+            const preco = p.preco && p.preco > 0 ? toBRL(p.preco) : 0;
 
       return {
         id: ("simple-" + Buffer.from(p.onde_comprar).toString("base64")).replace(/=+$/, ""),
@@ -571,21 +545,6 @@ app.post("/api/generate-products", async (req, res) => {
         onde_comprar: addAffiliate(p.onde_comprar),
       };
     });
-
-    // ✅ fallback só se realmente não tiver nenhum produto
-    const fallbackUrl = addAffiliate(`${BASE}/collections/shop-all`);
-    while (top5.length < 5) {
-      top5.push({
-        id: "simple-shopall-" + (top5.length + 1),
-        nome: "Sugestões em Shop All (Simple Organic)",
-        marca: "Simple Organic",
-        preco: toBRL(Math.max(39.9, BUDGET_MIN || 39.9)),
-        foto: FACE_FALLBACK_IMGS[top5.length % FACE_FALLBACK_IMGS.length],
-        beneficios: ["Veja mais opções disponíveis no site"],
-        motivo: "Não encontramos itens suficientes no momento; veja opções na coleção completa.",
-        onde_comprar: fallbackUrl,
-      });
-    }
 
     return res.json({ products: top5.slice(0, 5) });
   } catch (err) {
