@@ -593,7 +593,7 @@ app.post("/api/create-pix", async (req, res) => {
   try {
     const body = req.body || {};
     const amount = body.amount != null ? body.amount : 4.99;
-    const description = body.description || "Desbloqueio recomendações + cupom APP10";
+    const description = body.description || "Desbloqueio recomendações + cupom exclusivo";
     const nome = body.nome;
     const email = body.email;
 
